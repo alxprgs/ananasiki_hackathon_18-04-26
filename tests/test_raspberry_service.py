@@ -32,7 +32,11 @@ class RaspberryServiceTests(unittest.TestCase):
                 )
             }
         )
-        service = RaspberryService(runner=runner)
+        service = RaspberryService(
+            runner=runner,
+            raspberry_pi_detector=lambda: False,
+            euid_getter=lambda: 1000,
+        )
 
         service.configure_ap("MazeBot", "RescueMaze123", channel=6, ipv4_cidr="192.168.10.1/24")
 
@@ -47,7 +51,11 @@ class RaspberryServiceTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
             return subprocess.CompletedProcess(command, 4, stdout="", stderr="permission denied")
 
-        service = RaspberryService(runner=failing_runner)
+        service = RaspberryService(
+            runner=failing_runner,
+            raspberry_pi_detector=lambda: False,
+            euid_getter=lambda: 1000,
+        )
 
         with self.assertRaises(RaspberryCommandError):
             service.configure_ap("MazeBot", "RescueMaze123")
@@ -80,7 +88,11 @@ class RaspberryServiceTests(unittest.TestCase):
                 )
             }
         )
-        service = RaspberryService(runner=runner)
+        service = RaspberryService(
+            runner=runner,
+            raspberry_pi_detector=lambda: False,
+            euid_getter=lambda: 1000,
+        )
 
         with patch.object(os, "kill") as kill_mock:
             terminated = service.disconnect_all_ssh()
@@ -102,7 +114,12 @@ class RaspberryServiceTests(unittest.TestCase):
                     )
                 }
             )
-            service = RaspberryService(runner=runner, state_file=state_file)
+            service = RaspberryService(
+                runner=runner,
+                state_file=state_file,
+                raspberry_pi_detector=lambda: False,
+                euid_getter=lambda: 1000,
+            )
 
             service.disable_ap()
 
@@ -111,6 +128,38 @@ class RaspberryServiceTests(unittest.TestCase):
         finally:
             if state_file.exists():
                 state_file.unlink()
+
+    def test_privilege_check_blocks_raspberry_pi_without_root(self) -> None:
+        runner = RecordingRunner({})
+        service = RaspberryService(
+            runner=runner,
+            raspberry_pi_detector=lambda: True,
+            euid_getter=lambda: 1000,
+        )
+
+        with self.assertRaises(RaspberryCommandError) as error:
+            service.configure_ap("MazeBot", "RescueMaze123")
+
+        self.assertIn("нужны повышенные права", str(error.exception))
+        self.assertEqual(runner.commands, [])
+
+    def test_privilege_check_is_skipped_outside_raspberry_pi(self) -> None:
+        runner = RecordingRunner(
+            {
+                ("nmcli", "connection", "show", "rescue-maze-ap"): subprocess.CompletedProcess(
+                    ["nmcli"], 10, stdout="", stderr="unknown connection"
+                )
+            }
+        )
+        service = RaspberryService(
+            runner=runner,
+            raspberry_pi_detector=lambda: False,
+            euid_getter=lambda: 1000,
+        )
+
+        service.configure_ap("MazeBot", "RescueMaze123")
+
+        self.assertGreater(len(runner.commands), 0)
 
 
 if __name__ == "__main__":

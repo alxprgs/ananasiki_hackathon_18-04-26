@@ -1,3 +1,11 @@
+"""Клиентский API для управления Arduino по serial-протоколу Rescue Maze.
+
+Модуль инкапсулирует:
+- поиск и валидацию Arduino по USB serial;
+- обмен newline-delimited JSON сообщениями;
+- удобные Python-объекты для моторов, датчиков и опциональных актуаторов.
+"""
+
 from __future__ import annotations
 
 import json
@@ -95,7 +103,19 @@ class _StepperMoveOptions:
 
 
 class ArduinoService:
-    """Высокоуровневый API управления поверх построчного JSON serial-протокола."""
+    """Высокоуровневый API управления поверх построчного JSON serial-протокола.
+
+    Экземпляр класса устанавливает соединение с Arduino, проверяет его через
+    команду ``ping`` и затем предоставляет готовые команды для:
+    - чтения расстояния с ультразвуковых датчиков;
+    - чтения состояния кнопки;
+    - управления моторами гусениц;
+    - управления сервоприводом, реле и шаговым двигателем.
+
+    Публичные атрибуты ``distance_sensor``, ``eng_all``, ``eng_l``, ``eng_r``,
+    ``servo``, ``relay`` и ``stepper`` являются частью рабочего API и
+    используются как удобные фасады поверх базового serial-протокола.
+    """
 
     def __init__(
         self,
@@ -108,6 +128,28 @@ class ArduinoService:
         serial_factory: Callable[..., Any] | None = None,
         port_enumerator: Callable[[], list[Any]] | None = None,
     ) -> None:
+        """Создаёт сервис обмена с Arduino и немедленно открывает соединение.
+
+        Args:
+            port: Явный serial-порт Arduino. Если ``None``, используется
+                автопоиск по доступным портам с последующей проверкой через
+                ``ping``.
+            baudrate: Скорость serial-соединения.
+            timeout: Таймаут чтения и записи serial-соединения в секундах.
+            retry_count: Количество повторов для идемпотентных команд чтения.
+            logger: Пользовательский logger. Если не передан, используется
+                модульный logger.
+            serial_factory: Точка расширения для подмены конструктора serial-
+                подключения, полезна для тестов.
+            port_enumerator: Точка расширения для подмены механизма поиска
+                serial-портов, полезна для тестов.
+
+        Raises:
+            ArduinoDependencyError: Если в среде отсутствует pyserial.
+            ArduinoUnavailableError: Если Arduino не найдена.
+            ArduinoProtocolError: Если найденное устройство не прошло проверку
+                протокола.
+        """
         self._logger = logger or LOGGER
         self._serial_factory = serial_factory or _default_serial_factory
         self._port_enumerator = port_enumerator or _default_port_enumerator
@@ -216,22 +258,86 @@ class ArduinoService:
         self.close()
 
     def ping(self) -> dict[str, Any]:
+        """Проверяет, что Arduino отвечает по протоколу управления.
+
+        Returns:
+            Словарь ``data`` из ответа Arduino. Обычно содержит ``pong=True`` и
+            строку версии прошивки.
+
+        Raises:
+            SerialTimeoutError: Если ответ не пришёл вовремя.
+            ArduinoProtocolError: Если ответ повреждён или содержит ошибку.
+        """
         return self._send_request("ping", idempotent=True, retries=self._retry_count)
 
     def status(self) -> dict[str, Any]:
+        """Запрашивает сводное состояние Arduino и подключённой периферии.
+
+        Returns:
+            Словарь со снимком текущего состояния: статус кнопки, текущие PWM
+            обоих моторов, активность watchdog, реле, шагового двигателя и
+            последние измерения расстояния.
+
+        Raises:
+            SerialTimeoutError: Если Arduino не ответила вовремя.
+            ArduinoProtocolError: Если протокол ответа нарушен.
+        """
         return self._send_request("get_status", idempotent=True, retries=self._retry_count)
 
     def button_status(self) -> bool:
+        """Возвращает текущее состояние кнопки запуска или пользовательской кнопки.
+
+        Returns:
+            ``True``, если кнопка нажата, иначе ``False``.
+
+        Raises:
+            SerialTimeoutError: Если Arduino не ответила вовремя.
+            ArduinoProtocolError: Если ответ повреждён или вернул ошибку.
+        """
         response = self._send_request("get_button", idempotent=True, retries=self._retry_count)
         return bool(response["pressed"])
 
     def stop_all(self) -> dict[str, Any]:
+        """Немедленно останавливает все движения на Arduino.
+
+        Команда сбрасывает PWM обоих моторов и останавливает шаговый двигатель,
+        если он активен.
+
+        Returns:
+            Словарь ``data`` из подтверждения Arduino.
+        """
         return self._send_request("stop_all")
 
     def set_servo(self, angle_deg: float) -> dict[str, Any]:
+        """Устанавливает угол сервопривода в градусах.
+
+        Args:
+            angle_deg: Целевой угол. На стороне Arduino значение будет
+                ограничено диапазоном ``0..180``.
+
+        Returns:
+            Словарь ``data`` с фактическим установленным углом.
+
+        Raises:
+            UnsupportedHardwareError: Если сервопривод отключён в конфигурации
+                прошивки.
+            ArduinoProtocolError: Если команда отклонена прошивкой.
+        """
         return self._send_request("set_servo", {"angle_deg": int(round(angle_deg))})
 
     def set_relay(self, enabled: bool) -> dict[str, Any]:
+        """Переключает реле в состояние включено/выключено.
+
+        Args:
+            enabled: ``True`` для включения реле, ``False`` для выключения.
+
+        Returns:
+            Словарь ``data`` с итоговым состоянием реле.
+
+        Raises:
+            UnsupportedHardwareError: Если реле отключено в прошивке.
+            ArduinoProtocolError: Если команда отклонена прошивкой.
+        """
         return self._send_request("set_relay", {"enabled": bool(enabled)})
 
     def move_stepper(
@@ -242,6 +348,23 @@ class ArduinoService:
         direction: Literal["forward", "reverse"] = "forward",
         duration_ms: int | None = None,
     ) -> dict[str, Any]:
+        """Запускает шаговый двигатель с заданными параметрами.
+
+        Args:
+            steps: Количество шагов. Если ``None``, двигатель работает без
+                ограничения по шагам до отдельной остановки или истечения
+                ``duration_ms``.
+            rpm: Целевая скорость в оборотах в минуту.
+            direction: Направление ``forward`` или ``reverse``.
+            duration_ms: Ограничение времени работы в миллисекундах.
+
+        Returns:
+            Словарь ``data`` с подтверждением запуска и параметрами движения.
+
+        Raises:
+            UnsupportedHardwareError: Если шаговый двигатель отключён.
+            ArduinoProtocolError: Если команда отклонена прошивкой.
+        """
         options = _StepperMoveOptions(
             steps=steps,
             rpm=rpm,
@@ -259,6 +382,15 @@ class ArduinoService:
         return self._send_request("stepper_move", args)
 
     def stop_stepper(self) -> dict[str, Any]:
+        """Останавливает шаговый двигатель.
+
+        Returns:
+            Словарь ``data`` из ответа Arduino.
+
+        Raises:
+            UnsupportedHardwareError: Если шаговый двигатель не поддерживается.
+            ArduinoProtocolError: Если команда завершилась ошибкой.
+        """
         return self._send_request("stepper_stop")
 
     def _send_request(
@@ -335,10 +467,28 @@ class ArduinoService:
 
 
 class DistanceSensorAccessor:
+    """Фасад для чтения данных с ультразвуковых датчиков расстояния."""
+
     def __init__(self, service: ArduinoService) -> None:
         self._service = service
 
     def get(self, sensor_id: int, unit: UnitName = "mm") -> float:
+        """Читает расстояние с выбранного ультразвукового датчика.
+
+        Args:
+            sensor_id: Номер датчика, поддерживаются только ``1`` и ``2``.
+            unit: Единица измерения результата: миллиметры, сантиметры или
+                метры.
+
+        Returns:
+            Расстояние в выбранной единице измерения.
+
+        Raises:
+            ValueError: Если передан неверный номер датчика или единица.
+            SerialTimeoutError: Если Arduino не ответила вовремя.
+            ArduinoProtocolError: Если датчик временно недоступен или ответ
+                повреждён.
+        """
         if sensor_id not in (1, 2):
             raise ValueError("sensor_id должен быть равен 1 или 2")
         response = self._service._send_request(
@@ -352,15 +502,33 @@ class DistanceSensorAccessor:
 
 
 class MotorChannel:
+    """Фасад для формирования команд управления конкретной группой моторов."""
+
     def __init__(self, service: ArduinoService, target: MotorTarget) -> None:
         self._service = service
         self._target = target
 
     def pwm(self, percent: float) -> "MotorCommandBuilder":
+        """Создаёт объект-команду для установки мощности моторов.
+
+        Args:
+            percent: Мощность в процентах от ``-100`` до ``100``. Отрицательные
+                значения означают обратное направление.
+
+        Returns:
+            Объект ``MotorCommandBuilder``, который можно сразу отправить через
+            ``.now()`` или дополнить длительностью через ``.time(seconds)``.
+        """
         return MotorCommandBuilder(self._service, self._target, _clamp_pwm(percent))
 
 
 class MotorCommandBuilder:
+    """Построитель одной атомарной команды управления моторами.
+
+    Экземпляр создаётся методом ``MotorChannel.pwm()`` и предназначен для
+    ровно одной отправки команды на Arduino.
+    """
+
     def __init__(self, service: ArduinoService, target: MotorTarget, percent: int) -> None:
         self._service = service
         self._target = target
@@ -377,9 +545,30 @@ class MotorCommandBuilder:
         return self._service._send_request("set_motor", args)
 
     def time(self, seconds: float) -> dict[str, Any]:
+        """Отправляет команду с ограничением по времени.
+
+        Args:
+            seconds: Сколько секунд моторы должны работать с указанной мощностью.
+
+        Returns:
+            Словарь ``data`` из подтверждения Arduino.
+
+        Raises:
+            ValueError: Если передана неположительная длительность.
+            ArduinoProtocolError: Если команда отклонена.
+        """
         return self._send(duration_ms=_seconds_to_ms(seconds))
 
     def now(self) -> dict[str, Any]:
+        """Немедленно отправляет команду без ограничения по времени.
+
+        Returns:
+            Словарь ``data`` из подтверждения Arduino.
+
+        Notes:
+            Моторы будут работать до следующей команды, вызова ``stop_all`` или
+            срабатывания watchdog на стороне Arduino.
+        """
         return self._send()
 
     def __del__(self) -> None:  # pragma: no cover - время вызова деструктора зависит от рантайма
@@ -392,28 +581,52 @@ class MotorCommandBuilder:
 
 
 class ServoController:
+    """Удобный фасад для команд управления сервоприводом."""
+
     def __init__(self, service: ArduinoService) -> None:
         self._service = service
 
     def set(self, angle_deg: float) -> dict[str, Any]:
+        """Устанавливает угол сервопривода.
+
+        Args:
+            angle_deg: Целевой угол в градусах.
+
+        Returns:
+            Словарь ``data`` с подтверждённым углом.
+        """
         return self._service.set_servo(angle_deg)
 
 
 class RelayController:
+    """Удобный фасад для включения и выключения реле."""
+
     def __init__(self, service: ArduinoService) -> None:
         self._service = service
 
     def on(self) -> dict[str, Any]:
+        """Включает реле и возвращает подтверждение Arduino."""
         return self._service.set_relay(True)
 
     def off(self) -> dict[str, Any]:
+        """Выключает реле и возвращает подтверждение Arduino."""
         return self._service.set_relay(False)
 
     def set(self, enabled: bool) -> dict[str, Any]:
+        """Устанавливает реле в произвольное состояние.
+
+        Args:
+            enabled: ``True`` для включения, ``False`` для выключения.
+
+        Returns:
+            Словарь ``data`` с итоговым состоянием реле.
+        """
         return self._service.set_relay(enabled)
 
 
 class StepperController:
+    """Удобный фасад для команд управления шаговым двигателем."""
+
     def __init__(self, service: ArduinoService) -> None:
         self._service = service
 
@@ -425,6 +638,18 @@ class StepperController:
         direction: Literal["forward", "reverse"] = "forward",
         duration: float | None = None,
     ) -> dict[str, Any]:
+        """Запускает шаговый двигатель через high-level Python API.
+
+        Args:
+            steps: Ограничение по числу шагов или ``None`` для непрерывной
+                работы.
+            rpm: Скорость в оборотах в минуту.
+            direction: Направление ``forward`` или ``reverse``.
+            duration: Ограничение по времени в секундах.
+
+        Returns:
+            Словарь ``data`` из ответа Arduino.
+        """
         duration_ms = _seconds_to_ms(duration) if duration is not None else None
         return self._service.move_stepper(
             steps=steps,
@@ -434,4 +659,5 @@ class StepperController:
         )
 
     def stop(self) -> dict[str, Any]:
+        """Останавливает шаговый двигатель и возвращает подтверждение Arduino."""
         return self._service.stop_stepper()
