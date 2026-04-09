@@ -123,6 +123,7 @@ from raspberry.raspberry_service import RaspberryService
 
 service = RaspberryService()
 service.configure_ap("RescueMazeRobot", "RescueMaze123", channel=6)
+service.configure_ap("RescueMazeRobot", "RescueMaze123", channel="auto")
 service.enable_ap()
 service.disable_ap()
 service.disconnect_all_ssh()
@@ -134,6 +135,14 @@ service.disconnect_all_ssh()
 - `enable_ap()`
 - `disable_ap()`
 - `disconnect_all_ssh()`
+- `select_ap_channel()`
+
+Автовыбор канала:
+
+- доступен через `configure_ap(..., channel="auto")` или отдельный вызов `select_ap_channel()`;
+- учитывает только каналы, которые реально поддерживает Wi‑Fi адаптер Raspberry Pi;
+- старается выбрать наименее загруженный канал в диапазоне 2.4 ГГц;
+- приоритетно использует непересекающиеся каналы `1`, `6` и `11`.
 
 ## Распиновка по умолчанию
 

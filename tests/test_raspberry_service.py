@@ -7,7 +7,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from raspberry.raspberry_service import ProcessInfo, RaspberryCommandError, RaspberryService
+from raspberry.raspberry_service import (
+    ProcessInfo,
+    RaspberryCommandError,
+    RaspberryService,
+    WifiAccessPointInfo,
+)
 
 
 class RecordingRunner:
@@ -59,6 +64,47 @@ class RaspberryServiceTests(unittest.TestCase):
 
         with self.assertRaises(RaspberryCommandError):
             service.configure_ap("MazeBot", "RescueMaze123")
+
+    def test_configure_ap_accepts_auto_channel(self) -> None:
+        runner = RecordingRunner(
+            {
+                ("nmcli", "device", "status"): subprocess.CompletedProcess(
+                    ["nmcli"], 0, stdout="DEVICE TYPE STATE CONNECTION\nwlan0 wifi disconnected --\n", stderr=""
+                ),
+                ("iw", "phy"): subprocess.CompletedProcess(
+                    ["iw"], 0, stdout="* 2412 MHz [1]\n* 2437 MHz [6]\n* 2462 MHz [11]\n", stderr=""
+                ),
+                (
+                    "nmcli",
+                    "-t",
+                    "-f",
+                    "CHAN,SIGNAL",
+                    "device",
+                    "wifi",
+                    "list",
+                    "--rescan",
+                    "yes",
+                    "ifname",
+                    "wlan0",
+                ): subprocess.CompletedProcess(
+                    ["nmcli"], 0, stdout="1:80\n6:30\n11:10\n", stderr=""
+                ),
+                ("nmcli", "connection", "show", "rescue-maze-ap"): subprocess.CompletedProcess(
+                    ["nmcli"], 10, stdout="", stderr="unknown connection"
+                ),
+            }
+        )
+        service = RaspberryService(
+            runner=runner,
+            raspberry_pi_detector=lambda: False,
+            euid_getter=lambda: 1000,
+        )
+
+        service.configure_ap("MazeBot", "RescueMaze123", channel="auto")
+
+        modify_command = runner.commands[-1]
+        channel_index = modify_command.index("802-11-wireless.channel") + 1
+        self.assertEqual(modify_command[channel_index], "11")
 
     def test_disconnect_all_ssh_terminates_session_processes_but_not_master(self) -> None:
         processes = [
@@ -128,6 +174,68 @@ class RaspberryServiceTests(unittest.TestCase):
         finally:
             if state_file.exists():
                 state_file.unlink()
+
+    def test_parse_iw_phy_channels_extracts_supported_24ghz_values(self) -> None:
+        output = """
+        Wiphy phy0
+                Frequencies:
+                        * 2412 MHz [1] (20.0 dBm)
+                        * 2437 MHz [6] (20.0 dBm)
+                        * 2462 MHz [11] (20.0 dBm)
+                        * 2472 MHz [13] (disabled)
+                        * 5180 MHz [36] (20.0 dBm)
+        """
+
+        channels = RaspberryService._parse_iw_phy_channels(output)
+
+        self.assertEqual(channels, [1, 6, 11])
+
+    def test_parse_wifi_scan_output_reads_channel_and_signal(self) -> None:
+        output = "1:77\n6:55\n11:22\n"
+
+        access_points = RaspberryService._parse_wifi_scan_output(output)
+
+        self.assertEqual(
+            access_points,
+            [
+                WifiAccessPointInfo(channel=1, signal=77),
+                WifiAccessPointInfo(channel=6, signal=55),
+                WifiAccessPointInfo(channel=11, signal=22),
+            ],
+        )
+
+    def test_select_ap_channel_prefers_least_loaded_non_overlapping_channel(self) -> None:
+        runner = RecordingRunner(
+            {
+                ("iw", "phy"): subprocess.CompletedProcess(
+                    ["iw"], 0, stdout="* 2412 MHz [1]\n* 2437 MHz [6]\n* 2462 MHz [11]\n", stderr=""
+                ),
+                (
+                    "nmcli",
+                    "-t",
+                    "-f",
+                    "CHAN,SIGNAL",
+                    "device",
+                    "wifi",
+                    "list",
+                    "--rescan",
+                    "yes",
+                    "ifname",
+                    "wlan0",
+                ): subprocess.CompletedProcess(
+                    ["nmcli"], 0, stdout="1:90\n1:60\n6:50\n11:15\n", stderr=""
+                ),
+            }
+        )
+        service = RaspberryService(
+            runner=runner,
+            raspberry_pi_detector=lambda: False,
+            euid_getter=lambda: 1000,
+        )
+
+        channel = service.select_ap_channel("wlan0")
+
+        self.assertEqual(channel, 11)
 
     def test_privilege_check_blocks_raspberry_pi_without_root(self) -> None:
         runner = RecordingRunner({})

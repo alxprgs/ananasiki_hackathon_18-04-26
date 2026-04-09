@@ -6,11 +6,12 @@ import json
 import logging
 import os
 import platform
+import re
 import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Literal
 
 
 LOGGER = logging.getLogger(__name__)
@@ -30,6 +31,12 @@ class ProcessInfo:
     ppid: int
     command: str
     args: str
+
+
+@dataclass(slots=True)
+class WifiAccessPointInfo:
+    channel: int
+    signal: int
 
 
 class RaspberryService:
@@ -79,15 +86,17 @@ class RaspberryService:
         ssid: str,
         password: str,
         *,
-        channel: int = 1,
+        channel: int | Literal["auto"] = 1,
         ipv4_cidr: str = "192.168.4.1/24",
     ) -> None:
         """Создаёт или обновляет профиль точки доступа в NetworkManager.
 
         Args:
-            ssid: Имя Wi-Fi сети, которую будет раздавать Raspberry Pi.
+            ssid: Имя Wi‑Fi сети, которую будет раздавать Raspberry Pi.
             password: Пароль WPA-PSK для точки доступа.
-            channel: Радиоканал Wi-Fi.
+            channel: Радиоканал Wi‑Fi. Можно передать число или строку
+                ``"auto"``, чтобы выбрать канал автоматически на основе
+                загруженности эфира и поддерживаемых адаптером частот.
             ipv4_cidr: Адрес и маска сети для интерфейса AP в формате CIDR.
 
         Raises:
@@ -100,8 +109,12 @@ class RaspberryService:
             raise ValueError("ssid не должен быть пустым")
         if len(password) < 8:
             raise ValueError("password должен содержать минимум 8 символов")
-        if not 1 <= channel <= 13:
+        if channel != "auto" and not 1 <= channel <= 13:
             raise ValueError("channel должен быть в диапазоне от 1 до 13")
+
+        selected_channel = channel
+        if channel == "auto":
+            selected_channel = self.select_ap_channel()
 
         if not self._connection_exists(self._ap_profile_name):
             self._nmcli(
@@ -128,7 +141,7 @@ class RaspberryService:
             "802-11-wireless.band",
             "bg",
             "802-11-wireless.channel",
-            str(channel),
+            str(selected_channel),
             "wifi-sec.key-mgmt",
             "wpa-psk",
             "wifi-sec.psk",
@@ -142,6 +155,56 @@ class RaspberryService:
             "connection.autoconnect",
             "no",
         )
+
+    def select_ap_channel(self, wifi_device: str | None = None) -> int:
+        """Автоматически выбирает наименее загруженный канал для AP.
+
+        Алгоритм рассчитан на режим точки доступа в диапазоне 2.4 ГГц и
+        опирается на две группы данных:
+        - какие каналы реально поддерживает Wi‑Fi адаптер Raspberry Pi;
+        - какие соседние точки доступа сейчас видны в эфире.
+
+        Приоритетно рассматриваются непересекающиеся каналы ``1``, ``6`` и
+        ``11``. Если адаптер или регуляторный домен не позволяют использовать
+        эти каналы, сервис аккуратно переходит к поддерживаемым альтернативам.
+
+        Args:
+            wifi_device: Имя Wi‑Fi интерфейса. Если не указано, определяется
+                автоматически.
+
+        Returns:
+            Номер канала, который стоит использовать для точки доступа.
+
+        Raises:
+            RaspberryCommandError: Если не удалось определить Wi‑Fi интерфейс,
+                получить список поддерживаемых каналов или просканировать эфир.
+        """
+        self._ensure_elevated_privileges()
+        wifi_device = wifi_device or self._detect_wifi_device()
+        supported_channels = self._get_supported_24ghz_channels(wifi_device)
+        if not supported_channels:
+            raise RaspberryCommandError(
+                f"Не удалось определить поддерживаемые 2.4 ГГц каналы для интерфейса {wifi_device}."
+            )
+
+        access_points = self._scan_wifi_access_points(wifi_device)
+        preferred_channels = [channel for channel in (1, 6, 11) if channel in supported_channels]
+        candidate_channels = preferred_channels or supported_channels
+
+        best_channel = min(
+            candidate_channels,
+            key=lambda candidate: (
+                self._channel_interference_score(candidate, access_points),
+                0 if candidate in preferred_channels else 1,
+                candidate,
+            ),
+        )
+        self._logger.info(
+            "Автоматически выбран Wi‑Fi канал %s для интерфейса %s",
+            best_channel,
+            wifi_device,
+        )
+        return best_channel
 
     def enable_ap(self) -> None:
         """Активирует AP-профиль на Wi-Fi интерфейсе Raspberry Pi.
@@ -275,6 +338,98 @@ class RaspberryService:
             if device == wifi_device:
                 return name
         return None
+
+    def _get_supported_24ghz_channels(self, wifi_device: str) -> list[int]:
+        channels = self._parse_iw_phy_channels(self._run_command(["iw", "phy"], check=False).stdout)
+        if channels:
+            return channels
+
+        iwlist_result = self._run_command(["iwlist", wifi_device, "frequency"], check=False)
+        channels = self._parse_iwlist_channels(iwlist_result.stdout)
+        if channels:
+            return channels
+
+        return []
+
+    @staticmethod
+    def _parse_iw_phy_channels(output: str) -> list[int]:
+        channels: set[int] = set()
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if "MHz" not in line or "disabled" in line:
+                continue
+            match = re.search(r"\[(\d+)\]", line)
+            if match is None:
+                continue
+            channel = int(match.group(1))
+            if 1 <= channel <= 13:
+                channels.add(channel)
+        return sorted(channels)
+
+    @staticmethod
+    def _parse_iwlist_channels(output: str) -> list[int]:
+        channels: set[int] = set()
+        for raw_line in output.splitlines():
+            match = re.search(r"Channel\s+(\d+)", raw_line, re.IGNORECASE)
+            if match is None:
+                continue
+            channel = int(match.group(1))
+            if 1 <= channel <= 13:
+                channels.add(channel)
+        return sorted(channels)
+
+    def _scan_wifi_access_points(self, wifi_device: str) -> list[WifiAccessPointInfo]:
+        result = self._nmcli(
+            "-t",
+            "-f",
+            "CHAN,SIGNAL",
+            "device",
+            "wifi",
+            "list",
+            "--rescan",
+            "yes",
+            "ifname",
+            wifi_device,
+        )
+        return self._parse_wifi_scan_output(result.stdout)
+
+    @staticmethod
+    def _parse_wifi_scan_output(output: str) -> list[WifiAccessPointInfo]:
+        access_points: list[WifiAccessPointInfo] = []
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split(":")
+            if len(parts) < 2:
+                continue
+            channel_text = parts[0].strip()
+            signal_text = parts[-1].strip()
+            if not channel_text.isdigit() or not signal_text.isdigit():
+                continue
+            channel = int(channel_text)
+            signal = int(signal_text)
+            if 1 <= channel <= 13:
+                access_points.append(WifiAccessPointInfo(channel=channel, signal=signal))
+        return access_points
+
+    @staticmethod
+    def _channel_interference_score(channel: int, access_points: Iterable[WifiAccessPointInfo]) -> float:
+        weights = {
+            0: 1.0,
+            1: 2.5,
+            2: 2.0,
+            3: 1.5,
+            4: 1.2,
+        }
+        score = 0.0
+        for access_point in access_points:
+            distance = abs(access_point.channel - channel)
+            weight = weights.get(distance)
+            if weight is None:
+                continue
+            score += access_point.signal * weight
+        return score
 
     def _read_process_table(self) -> list[ProcessInfo]:
         result = self._run_command(["ps", "-eo", "pid=,ppid=,comm=,args="])
