@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from itertools import count
 from typing import Any, Callable, Literal
@@ -26,6 +27,8 @@ except ImportError:  # pragma: no cover - проверяется через вн
 LOGGER = logging.getLogger(__name__)
 UnitName = Literal["mm", "cm", "m"]
 MotorTarget = Literal["all", "left", "right"]
+WallSide = Literal["left", "right"]
+RotationDirection = Literal["left", "right"]
 
 
 class ArduinoServiceError(RuntimeError):
@@ -308,6 +311,159 @@ class ArduinoService:
         """
         return self._send_request("stop_all")
 
+    def align_parallel_to_wall(
+        self,
+        *,
+        front_sensor_id: int = 1,
+        rear_sensor_id: int = 2,
+        wall_side: WallSide = "right",
+        tolerance_mm: float = 10.0,
+        turn_power: float = 18.0,
+        pulse_seconds: float = 0.12,
+        settle_seconds: float = 0.05,
+        max_iterations: int = 10,
+    ) -> dict[str, Any]:
+        """Поворачивает робота до состояния, близкого к параллели со стеной.
+
+        Метод рассчитан на схему, в которой два ультразвуковых датчика стоят на
+        одной стороне робота: один ближе к передней части, второй ближе к
+        задней. Сервис сравнивает их показания и делает короткие повороты на
+        месте, пока расстояния не станут одинаковыми или почти одинаковыми.
+
+        Логика не требует отдельной команды в прошивке Arduino: Raspberry Pi
+        использует уже существующие команды чтения датчиков и управления
+        моторами, поэтому метод можно добавить без изменения serial-протокола.
+
+        Args:
+            front_sensor_id: Идентификатор датчика, стоящего ближе к носу
+                робота.
+            rear_sensor_id: Идентификатор датчика, стоящего ближе к хвосту
+                робота.
+            wall_side: С какой стороны робота находится стена: ``"left"`` или
+                ``"right"``.
+            tolerance_mm: Допустимая разница между показаниями датчиков в
+                миллиметрах.
+            turn_power: Мощность корректирующего поворота в процентах. Берётся
+                по модулю и ограничивается диапазоном ``0..100``.
+            pulse_seconds: Длительность одного корректирующего поворота.
+            settle_seconds: Небольшая пауза после остановки, чтобы датчики и
+                корпус успели стабилизироваться перед новым измерением.
+            max_iterations: Максимальное число циклов измерения. Если за это
+                время допуск не достигнут, метод вернёт ``aligned=False``.
+
+        Returns:
+            Словарь с итогом выравнивания:
+            - ``aligned``: удалось ли уложиться в допуск;
+            - ``iterations``: сколько циклов измерения было выполнено;
+            - ``correction_steps``: сколько корректирующих импульсов поворота
+              понадобилось;
+            - ``front_distance_mm`` и ``rear_distance_mm``: последние измерения;
+            - ``delta_mm``: разница ``front - rear``;
+            - ``tolerance_mm``: использованный допуск;
+            - ``wall_side``: сторона стены;
+            - ``last_turn_direction``: последнее направление коррекции или
+              ``None``, если робот уже был выровнен.
+
+        Raises:
+            ValueError: Если параметры метода заданы некорректно.
+            SerialTimeoutError: Если Arduino перестала отвечать во время
+                выравнивания.
+            ArduinoProtocolError: Если одна из команд чтения или управления
+                завершилась ошибкой.
+        """
+        if front_sensor_id not in (1, 2):
+            raise ValueError("front_sensor_id должен быть равен 1 или 2")
+        if rear_sensor_id not in (1, 2):
+            raise ValueError("rear_sensor_id должен быть равен 1 или 2")
+        if front_sensor_id == rear_sensor_id:
+            raise ValueError("front_sensor_id и rear_sensor_id должны указывать на разные датчики")
+        if wall_side not in ("left", "right"):
+            raise ValueError('wall_side должен быть равен "left" или "right"')
+        if tolerance_mm < 0:
+            raise ValueError("tolerance_mm не может быть отрицательным")
+        if pulse_seconds <= 0:
+            raise ValueError("pulse_seconds должно быть больше нуля")
+        if settle_seconds < 0:
+            raise ValueError("settle_seconds не может быть отрицательным")
+        if max_iterations <= 0:
+            raise ValueError("max_iterations должно быть больше нуля")
+
+        bounded_turn_power = abs(_clamp_pwm(turn_power))
+        if bounded_turn_power == 0:
+            raise ValueError("turn_power должно быть больше нуля")
+
+        correction_steps = 0
+        last_front_distance_mm = 0.0
+        last_rear_distance_mm = 0.0
+        last_delta_mm = 0.0
+        last_turn_direction: RotationDirection | None = None
+
+        for iteration in range(1, max_iterations + 1):
+            last_front_distance_mm = self.distance_sensor.get(front_sensor_id, unit="mm")
+            last_rear_distance_mm = self.distance_sensor.get(rear_sensor_id, unit="mm")
+            last_delta_mm = float(last_front_distance_mm - last_rear_distance_mm)
+
+            self._logger.info(
+                "Проверка параллельности со стеной: итерация=%s/%s, front=%.1f мм, rear=%.1f мм, delta=%.1f мм",
+                iteration,
+                max_iterations,
+                last_front_distance_mm,
+                last_rear_distance_mm,
+                last_delta_mm,
+            )
+
+            if abs(last_delta_mm) <= tolerance_mm:
+                return {
+                    "aligned": True,
+                    "iterations": iteration,
+                    "correction_steps": correction_steps,
+                    "front_distance_mm": last_front_distance_mm,
+                    "rear_distance_mm": last_rear_distance_mm,
+                    "delta_mm": last_delta_mm,
+                    "tolerance_mm": float(tolerance_mm),
+                    "wall_side": wall_side,
+                    "last_turn_direction": last_turn_direction,
+                }
+
+            if iteration >= max_iterations:
+                break
+
+            last_turn_direction = self._select_wall_alignment_turn(last_delta_mm, wall_side)
+            correction_steps += 1
+            self._logger.info(
+                "Корректируем положение робота относительно %s стены: шаг=%s, направление=%s, мощность=%s%%, импульс=%.3f с",
+                wall_side,
+                correction_steps,
+                last_turn_direction,
+                bounded_turn_power,
+                pulse_seconds,
+            )
+            self._apply_turn_pulse(
+                direction=last_turn_direction,
+                turn_power=bounded_turn_power,
+                pulse_seconds=pulse_seconds,
+                settle_seconds=settle_seconds,
+            )
+
+        self._logger.warning(
+            "Не удалось вывести робота в допуск параллельности за %s итераций: front=%.1f мм, rear=%.1f мм, delta=%.1f мм",
+            max_iterations,
+            last_front_distance_mm,
+            last_rear_distance_mm,
+            last_delta_mm,
+        )
+        return {
+            "aligned": False,
+            "iterations": max_iterations,
+            "correction_steps": correction_steps,
+            "front_distance_mm": last_front_distance_mm,
+            "rear_distance_mm": last_rear_distance_mm,
+            "delta_mm": last_delta_mm,
+            "tolerance_mm": float(tolerance_mm),
+            "wall_side": wall_side,
+            "last_turn_direction": last_turn_direction,
+        }
+
     def set_servo(self, angle_deg: float) -> dict[str, Any]:
         """Устанавливает угол сервопривода в градусах.
 
@@ -392,6 +548,39 @@ class ArduinoService:
             ArduinoProtocolError: Если команда завершилась ошибкой.
         """
         return self._send_request("stepper_stop")
+
+    @staticmethod
+    def _select_wall_alignment_turn(delta_mm: float, wall_side: WallSide) -> RotationDirection:
+        if wall_side == "right":
+            return "right" if delta_mm > 0 else "left"
+        return "left" if delta_mm > 0 else "right"
+
+    def _apply_turn_pulse(
+        self,
+        *,
+        direction: RotationDirection,
+        turn_power: int,
+        pulse_seconds: float,
+        settle_seconds: float,
+    ) -> None:
+        left_pwm = turn_power if direction == "right" else -turn_power
+        right_pwm = -turn_power if direction == "right" else turn_power
+
+        self.eng_l.pwm(left_pwm).now()
+        try:
+            self.eng_r.pwm(right_pwm).now()
+            time.sleep(pulse_seconds)
+        finally:
+            try:
+                self.stop_all()
+            except Exception:
+                self._logger.debug(
+                    "Не удалось аварийно остановить моторы после корректирующего импульса выравнивания",
+                    exc_info=True,
+                )
+
+        if settle_seconds > 0:
+            time.sleep(settle_seconds)
 
     def _send_request(
         self,

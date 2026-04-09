@@ -1,4 +1,4 @@
-"""Сервисные команды Raspberry Pi для Wi‑Fi AP и управления SSH-сессиями."""
+"""Сервисные команды Raspberry Pi для Wi‑Fi AP, SSH и телеметрии платы."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal
 
 
 LOGGER = logging.getLogger(__name__)
@@ -45,7 +45,9 @@ class RaspberryService:
     Класс предназначен для операций, которые не выполняются Arduino:
     - настройка и переключение Raspberry Pi в AP-режим через NetworkManager;
     - восстановление клиентского Wi-Fi-профиля после выхода из AP;
-    - завершение активных SSH-сессий без остановки master-процесса ``sshd``.
+    - завершение активных SSH-сессий без остановки master-процесса ``sshd``;
+    - чтение штатной телеметрии платы: температуры и признаков проблем с
+      питанием.
     """
 
     def __init__(
@@ -274,6 +276,156 @@ class RaspberryService:
             terminated.append(pid)
         return terminated
 
+    def get_temperature_telemetry(self) -> dict[str, Any]:
+        """Возвращает текущую температуру Raspberry Pi и простую оценку нагрева.
+
+        Метод сначала пытается прочитать стандартный Linux sysfs-файл
+        ``/sys/class/thermal/thermal_zone0/temp``. Если он недоступен, сервис
+        делает резервную попытку через ``vcgencmd measure_temp``.
+
+        Returns:
+            Словарь со следующими полями:
+            - ``celsius``: температура в градусах Цельсия;
+            - ``fahrenheit``: та же температура в градусах Фаренгейта;
+            - ``state``: приблизительная словесная оценка нагрева
+              ``normal``/``warm``/``hot``/``critical``;
+            - ``source``: откуда были получены данные.
+
+        Raises:
+            RaspberryCommandError: Если ни один источник температурной
+                телеметрии не доступен или вернул повреждённые данные.
+        """
+        thermal_zone_path = Path("/sys/class/thermal/thermal_zone0/temp")
+        temperature_celsius: float | None = None
+        source: str | None = None
+
+        if self._path_exists(thermal_zone_path):
+            try:
+                temperature_celsius = self._parse_thermal_zone_temperature(self._read_text_file(thermal_zone_path))
+                source = str(thermal_zone_path)
+            except (OSError, ValueError) as exc:
+                self._logger.debug(
+                    "Не удалось прочитать температуру Raspberry Pi из %s: %s",
+                    thermal_zone_path,
+                    exc,
+                )
+
+        if temperature_celsius is None:
+            result = self._run_command(["vcgencmd", "measure_temp"], check=False)
+            if result.returncode != 0 or not result.stdout.strip():
+                stderr = (result.stderr or "").strip()
+                raise RaspberryCommandError(
+                    "Не удалось получить температуру Raspberry Pi через sysfs или vcgencmd: "
+                    f"{stderr or 'команда не вернула данных'}"
+                )
+            try:
+                temperature_celsius = self._parse_vcgencmd_temperature(result.stdout)
+            except ValueError as exc:
+                raise RaspberryCommandError(
+                    f"Не удалось разобрать температуру из vcgencmd: {result.stdout.strip()}"
+                ) from exc
+            source = "vcgencmd measure_temp"
+
+        return {
+            "celsius": round(temperature_celsius, 2),
+            "fahrenheit": round((temperature_celsius * 9.0 / 5.0) + 32.0, 2),
+            "state": self._temperature_state(temperature_celsius),
+            "source": source,
+        }
+
+    def get_power_telemetry(self) -> dict[str, Any]:
+        """Возвращает штатную телеметрию питания Raspberry Pi.
+
+        Важно понимать, что это не измерение аккумулятора, тока или внешнего
+        блока питания. Сервис читает только встроенные признаки состояния самой
+        платы Raspberry Pi: флаги undervoltage, throttling, ограничения частоты
+        и, если доступно, внутреннее напряжение ядра через ``vcgencmd``.
+
+        Returns:
+            Словарь с полями:
+            - ``throttled_raw``: исходная строка из ``vcgencmd get_throttled``;
+            - ``throttled_mask``: целочисленная битовая маска;
+            - ``core_voltage_volts``: напряжение ядра в вольтах или ``None``;
+            - ``voltage_source``: источник измерения напряжения или ``None``;
+            - ``undervoltage_now`` и ``undervoltage_occurred``;
+            - ``frequency_capped_now`` и ``frequency_capped_occurred``;
+            - ``throttled_now`` и ``throttling_occurred``;
+            - ``soft_temperature_limit_now`` и
+              ``soft_temperature_limit_occurred``;
+            - ``power_good_now``: нет ли сейчас признака просадки питания;
+            - ``performance_limited_now``: ограничена ли сейчас
+              производительность.
+
+        Raises:
+            RaspberryCommandError: Если ``vcgencmd get_throttled`` недоступна
+                или вернула неожиданный ответ.
+        """
+        throttled_result = self._run_command(["vcgencmd", "get_throttled"], check=False)
+        if throttled_result.returncode != 0 or not throttled_result.stdout.strip():
+            stderr = (throttled_result.stderr or "").strip()
+            raise RaspberryCommandError(
+                "Не удалось получить телеметрию питания Raspberry Pi через vcgencmd get_throttled: "
+                f"{stderr or 'команда не вернула данных'}"
+            )
+
+        try:
+            throttled_raw, throttled_mask = self._parse_vcgencmd_throttled(throttled_result.stdout)
+        except ValueError as exc:
+            raise RaspberryCommandError(
+                f"Не удалось разобрать ответ vcgencmd get_throttled: {throttled_result.stdout.strip()}"
+            ) from exc
+
+        core_voltage_volts: float | None = None
+        voltage_source: str | None = None
+        voltage_result = self._run_command(["vcgencmd", "measure_volts", "core"], check=False)
+        if voltage_result.returncode == 0 and voltage_result.stdout.strip():
+            try:
+                core_voltage_volts = self._parse_vcgencmd_voltage(voltage_result.stdout)
+                voltage_source = "vcgencmd measure_volts core"
+            except ValueError:
+                self._logger.debug(
+                    "Не удалось разобрать напряжение ядра из vcgencmd: %s",
+                    voltage_result.stdout.strip(),
+                )
+
+        undervoltage_now = bool(throttled_mask & 0x1)
+        frequency_capped_now = bool(throttled_mask & 0x2)
+        throttled_now = bool(throttled_mask & 0x4)
+        soft_temperature_limit_now = bool(throttled_mask & 0x8)
+
+        return {
+            "throttled_raw": throttled_raw,
+            "throttled_mask": throttled_mask,
+            "core_voltage_volts": core_voltage_volts,
+            "voltage_source": voltage_source,
+            "undervoltage_now": undervoltage_now,
+            "undervoltage_occurred": bool(throttled_mask & 0x10000),
+            "frequency_capped_now": frequency_capped_now,
+            "frequency_capped_occurred": bool(throttled_mask & 0x20000),
+            "throttled_now": throttled_now,
+            "throttling_occurred": bool(throttled_mask & 0x40000),
+            "soft_temperature_limit_now": soft_temperature_limit_now,
+            "soft_temperature_limit_occurred": bool(throttled_mask & 0x80000),
+            "power_good_now": not undervoltage_now,
+            "performance_limited_now": frequency_capped_now or throttled_now or soft_temperature_limit_now,
+        }
+
+    def get_board_telemetry(self) -> dict[str, Any]:
+        """Возвращает сводную телеметрию платы Raspberry Pi.
+
+        Это удобный метод верхнего уровня, который одним вызовом собирает
+        температуру и признаки проблем с питанием.
+
+        Returns:
+            Словарь с двумя ключами:
+            - ``temperature``: результат ``get_temperature_telemetry()``;
+            - ``power``: результат ``get_power_telemetry()``.
+        """
+        return {
+            "temperature": self.get_temperature_telemetry(),
+            "power": self.get_power_telemetry(),
+        }
+
     def _connection_exists(self, name: str) -> bool:
         result = self._nmcli("connection", "show", name, check=False)
         return result.returncode == 0
@@ -431,6 +583,46 @@ class RaspberryService:
             score += access_point.signal * weight
         return score
 
+    @staticmethod
+    def _parse_thermal_zone_temperature(raw_text: str) -> float:
+        match = re.search(r"(-?\d+)", raw_text)
+        if match is None:
+            raise ValueError("Не найдено целочисленное значение температуры")
+        return int(match.group(1)) / 1000.0
+
+    @staticmethod
+    def _parse_vcgencmd_temperature(output: str) -> float:
+        match = re.search(r"temp=([0-9]+(?:\.[0-9]+)?)'C", output)
+        if match is None:
+            raise ValueError("Не найдено значение температуры vcgencmd")
+        return float(match.group(1))
+
+    @staticmethod
+    def _parse_vcgencmd_voltage(output: str) -> float:
+        match = re.search(r"volt=([0-9]+(?:\.[0-9]+)?)V", output)
+        if match is None:
+            raise ValueError("Не найдено значение напряжения vcgencmd")
+        return float(match.group(1))
+
+    @staticmethod
+    def _parse_vcgencmd_throttled(output: str) -> tuple[str, int]:
+        stripped = output.strip()
+        match = re.search(r"throttled=(0x[0-9a-fA-F]+)", stripped)
+        if match is None:
+            raise ValueError("Не найдена throttled-маска")
+        raw_mask = match.group(1)
+        return raw_mask, int(raw_mask, 16)
+
+    @staticmethod
+    def _temperature_state(temperature_celsius: float) -> str:
+        if temperature_celsius < 60.0:
+            return "normal"
+        if temperature_celsius < 75.0:
+            return "warm"
+        if temperature_celsius < 80.0:
+            return "hot"
+        return "critical"
+
     def _read_process_table(self) -> list[ProcessInfo]:
         result = self._run_command(["ps", "-eo", "pid=,ppid=,comm=,args="])
         processes: list[ProcessInfo] = []
@@ -520,3 +712,11 @@ class RaspberryService:
         except json.JSONDecodeError:
             self._logger.warning("Файл состояния AP %s повреждён, он будет проигнорирован", self._state_file)
             return {}
+
+    @staticmethod
+    def _read_text_file(path: Path) -> str:
+        return path.read_text(encoding="utf-8", errors="ignore")
+
+    @staticmethod
+    def _path_exists(path: Path) -> bool:
+        return path.exists()

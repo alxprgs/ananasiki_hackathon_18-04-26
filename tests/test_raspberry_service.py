@@ -106,6 +106,87 @@ class RaspberryServiceTests(unittest.TestCase):
         channel_index = modify_command.index("802-11-wireless.channel") + 1
         self.assertEqual(modify_command[channel_index], "11")
 
+    def test_get_temperature_telemetry_prefers_sysfs(self) -> None:
+        runner = RecordingRunner({})
+        service = RaspberryService(
+            runner=runner,
+            raspberry_pi_detector=lambda: False,
+            euid_getter=lambda: 1000,
+        )
+
+        with patch.object(service, "_path_exists", return_value=True):
+            with patch.object(service, "_read_text_file", return_value="47500\n"):
+                telemetry = service.get_temperature_telemetry()
+
+        self.assertEqual(telemetry["celsius"], 47.5)
+        self.assertEqual(telemetry["state"], "normal")
+        self.assertEqual(runner.commands, [])
+
+    def test_get_temperature_telemetry_falls_back_to_vcgencmd(self) -> None:
+        runner = RecordingRunner(
+            {
+                ("vcgencmd", "measure_temp"): subprocess.CompletedProcess(
+                    ["vcgencmd"], 0, stdout="temp=71.2'C\n", stderr=""
+                )
+            }
+        )
+        service = RaspberryService(
+            runner=runner,
+            raspberry_pi_detector=lambda: False,
+            euid_getter=lambda: 1000,
+        )
+
+        with patch.object(service, "_path_exists", return_value=False):
+            telemetry = service.get_temperature_telemetry()
+
+        self.assertEqual(telemetry["celsius"], 71.2)
+        self.assertEqual(telemetry["state"], "warm")
+        self.assertEqual(telemetry["source"], "vcgencmd measure_temp")
+
+    def test_get_power_telemetry_parses_vcgencmd_flags(self) -> None:
+        runner = RecordingRunner(
+            {
+                ("vcgencmd", "get_throttled"): subprocess.CompletedProcess(
+                    ["vcgencmd"], 0, stdout="throttled=0x50005\n", stderr=""
+                ),
+                ("vcgencmd", "measure_volts", "core"): subprocess.CompletedProcess(
+                    ["vcgencmd"], 0, stdout="volt=0.8500V\n", stderr=""
+                ),
+            }
+        )
+        service = RaspberryService(
+            runner=runner,
+            raspberry_pi_detector=lambda: False,
+            euid_getter=lambda: 1000,
+        )
+
+        telemetry = service.get_power_telemetry()
+
+        self.assertEqual(telemetry["throttled_raw"], "0x50005")
+        self.assertEqual(telemetry["throttled_mask"], 0x50005)
+        self.assertEqual(telemetry["core_voltage_volts"], 0.85)
+        self.assertTrue(telemetry["undervoltage_now"])
+        self.assertTrue(telemetry["throttled_now"])
+        self.assertTrue(telemetry["undervoltage_occurred"])
+        self.assertTrue(telemetry["throttling_occurred"])
+        self.assertFalse(telemetry["power_good_now"])
+        self.assertTrue(telemetry["performance_limited_now"])
+
+    def test_get_board_telemetry_combines_temperature_and_power(self) -> None:
+        service = RaspberryService(
+            runner=RecordingRunner({}),
+            raspberry_pi_detector=lambda: False,
+            euid_getter=lambda: 1000,
+        )
+
+        with patch.object(service, "get_temperature_telemetry", return_value={"celsius": 48.0}) as temperature_mock:
+            with patch.object(service, "get_power_telemetry", return_value={"power_good_now": True}) as power_mock:
+                telemetry = service.get_board_telemetry()
+
+        self.assertEqual(telemetry, {"temperature": {"celsius": 48.0}, "power": {"power_good_now": True}})
+        temperature_mock.assert_called_once_with()
+        power_mock.assert_called_once_with()
+
     def test_disconnect_all_ssh_terminates_session_processes_but_not_master(self) -> None:
         processes = [
             ProcessInfo(pid=10, ppid=1, command="sshd", args="/usr/sbin/sshd -D [listener] 0 of 10-100 startups"),

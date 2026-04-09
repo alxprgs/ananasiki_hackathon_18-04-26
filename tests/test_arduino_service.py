@@ -4,6 +4,7 @@ import json
 import logging
 import unittest
 from dataclasses import dataclass
+from unittest.mock import patch
 
 from raspberry.arduino_service import ArduinoProtocolError, ArduinoService, ArduinoUnavailableError
 
@@ -164,6 +165,124 @@ class ArduinoServiceTests(unittest.TestCase):
                 serial_factory=lambda **kwargs: FakeSerial([]),
                 port_enumerator=lambda: [],
             )
+
+    @patch("raspberry.arduino_service.time.sleep", return_value=None)
+    def test_align_parallel_to_wall_turns_right_for_right_wall(self, _sleep) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"distance_mm":140}}\n',
+                '{"id":3,"ok":true,"data":{"distance_mm":100}}\n',
+                '{"id":4,"ok":true,"data":{"target":"left","pwm":20}}\n',
+                '{"id":5,"ok":true,"data":{"target":"right","pwm":-20}}\n',
+                '{"id":6,"ok":true,"data":{"stopped":true}}\n',
+                '{"id":7,"ok":true,"data":{"distance_mm":109}}\n',
+                '{"id":8,"ok":true,"data":{"distance_mm":104}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.align.right"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        result = service.align_parallel_to_wall(
+            front_sensor_id=1,
+            rear_sensor_id=2,
+            wall_side="right",
+            tolerance_mm=6.0,
+            turn_power=20,
+            pulse_seconds=0.1,
+            settle_seconds=0.02,
+            max_iterations=3,
+        )
+
+        self.assertTrue(result["aligned"])
+        self.assertEqual(result["correction_steps"], 1)
+        self.assertEqual(result["last_turn_direction"], "right")
+
+        left_motor_payload = json.loads(connection.writes[3])
+        right_motor_payload = json.loads(connection.writes[4])
+        self.assertEqual(left_motor_payload["args"]["target"], "left")
+        self.assertEqual(left_motor_payload["args"]["pwm"], 20)
+        self.assertEqual(right_motor_payload["args"]["target"], "right")
+        self.assertEqual(right_motor_payload["args"]["pwm"], -20)
+        service.close()
+
+    @patch("raspberry.arduino_service.time.sleep", return_value=None)
+    def test_align_parallel_to_wall_turns_left_for_left_wall(self, _sleep) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"distance_mm":150}}\n',
+                '{"id":3,"ok":true,"data":{"distance_mm":100}}\n',
+                '{"id":4,"ok":true,"data":{"target":"left","pwm":-15}}\n',
+                '{"id":5,"ok":true,"data":{"target":"right","pwm":15}}\n',
+                '{"id":6,"ok":true,"data":{"stopped":true}}\n',
+                '{"id":7,"ok":true,"data":{"distance_mm":106}}\n',
+                '{"id":8,"ok":true,"data":{"distance_mm":102}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.align.left"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        result = service.align_parallel_to_wall(
+            front_sensor_id=1,
+            rear_sensor_id=2,
+            wall_side="left",
+            tolerance_mm=5.0,
+            turn_power=15,
+            pulse_seconds=0.1,
+            settle_seconds=0.02,
+            max_iterations=3,
+        )
+
+        self.assertTrue(result["aligned"])
+        self.assertEqual(result["last_turn_direction"], "left")
+        left_motor_payload = json.loads(connection.writes[3])
+        right_motor_payload = json.loads(connection.writes[4])
+        self.assertEqual(left_motor_payload["args"]["pwm"], -15)
+        self.assertEqual(right_motor_payload["args"]["pwm"], 15)
+        service.close()
+
+    def test_align_parallel_to_wall_returns_false_after_max_iterations(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"distance_mm":150}}\n',
+                '{"id":3,"ok":true,"data":{"distance_mm":100}}\n',
+                '{"id":4,"ok":true,"data":{"target":"left","pwm":18}}\n',
+                '{"id":5,"ok":true,"data":{"target":"right","pwm":-18}}\n',
+                '{"id":6,"ok":true,"data":{"stopped":true}}\n',
+                '{"id":7,"ok":true,"data":{"distance_mm":148}}\n',
+                '{"id":8,"ok":true,"data":{"distance_mm":100}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.align.fail"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        with patch("raspberry.arduino_service.time.sleep", return_value=None):
+            result = service.align_parallel_to_wall(max_iterations=2)
+
+        self.assertFalse(result["aligned"])
+        self.assertEqual(result["correction_steps"], 1)
+        self.assertAlmostEqual(result["delta_mm"], 48.0)
+        service.close()
 
 
 if __name__ == "__main__":
