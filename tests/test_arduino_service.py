@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 import unittest
 from dataclasses import dataclass
+from pathlib import Path
 from unittest.mock import patch
 
-from raspberry.arduino_service import ArduinoProtocolError, ArduinoService, ArduinoUnavailableError
+from raspberry.arduino_service import (
+    ArduinoProtocolError,
+    ArduinoService,
+    ArduinoUnavailableError,
+    MotionMapCalibration,
+)
 
 
 @dataclass
@@ -42,7 +50,26 @@ class FakeSerial:
         self.closed = True
 
 
+class FakeClock:
+    def __init__(self, start: float = 0.0) -> None:
+        self.current = float(start)
+
+    def now(self) -> float:
+        return self.current
+
+    def advance(self, seconds: float) -> None:
+        self.current += float(seconds)
+
+
 class ArduinoServiceTests(unittest.TestCase):
+    def _make_test_dir(self, name: str) -> Path:
+        root = Path("tests") / ".tmp_activity_tests" / name
+        if root.exists():
+            shutil.rmtree(root)
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        return root
+
     def test_autodetects_first_valid_port(self) -> None:
         connections = {
             "COM_BAD": FakeSerial(['{"id":1,"ok":false,"error":{"code":"bad","message":"nope"}}\n']),
@@ -282,6 +309,202 @@ class ArduinoServiceTests(unittest.TestCase):
         self.assertFalse(result["aligned"])
         self.assertEqual(result["correction_steps"], 1)
         self.assertAlmostEqual(result["delta_mm"], 48.0)
+        service.close()
+
+    def test_activity_session_writes_actions_json_and_svg(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"pong":true}}\n',
+                '{"id":3,"ok":true,"data":{"pressed":false}}\n',
+                '{"id":4,"ok":true,"data":{"distance_mm":345}}\n',
+                '{"id":5,"ok":true,"data":{"target":"all","pwm":40,"duration_ms":1500}}\n',
+            ]
+        )
+        clock = FakeClock(start=10.0)
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.activity.files"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+            monotonic_clock=clock.now,
+        )
+
+        session_dir = self._make_test_dir("activity_files") / "session"
+        service.start_activity_session(
+            output_dir=session_dir,
+            calibration=MotionMapCalibration(
+                max_linear_speed_mm_per_sec=200.0,
+                max_turn_deg_per_sec=180.0,
+            ),
+        )
+
+        service.ping()
+        service.button_status()
+        service.distance_sensor.get(1, unit="cm")
+        service.eng_all.pwm(40).time(1.5)
+        summary = service.stop_activity_session()
+
+        self.assertEqual(Path(summary["output_dir"]), session_dir)
+        self.assertTrue((session_dir / "actions.txt").exists())
+        self.assertTrue((session_dir / "events.json").exists())
+        self.assertTrue((session_dir / "route.svg").exists())
+        self.assertAlmostEqual(summary["final_pose"]["x_mm"], 120.0, places=3)
+
+        actions_text = (session_dir / "actions.txt").read_text(encoding="utf-8")
+        self.assertIn("Проверка связи с Arduino на порту COM1 выполнена — Удачно", actions_text)
+        self.assertIn("Считано состояние кнопки: отпущена — Удачно", actions_text)
+        self.assertIn("Получено расстояние с датчика 1: 34.5 см — Удачно", actions_text)
+        self.assertIn("Робот проехал вперёд на команде 40% в течение 1.50 с — Выполнено", actions_text)
+
+        events = json.loads((session_dir / "events.json").read_text(encoding="utf-8"))
+        self.assertTrue(any(event["action"] == "set_motor" for event in events))
+        self.assertTrue(any(event["protocol_op"] == "get_distance" for event in events))
+
+        route_svg = (session_dir / "route.svg").read_text(encoding="utf-8")
+        self.assertIn("Оценочная карта движения, не точная одометрия", route_svg)
+        self.assertIn("polyline", route_svg)
+
+        service.close()
+
+    def test_activity_session_logs_errors_without_suppressing_exception(self) -> None:
+        connection = FakeSerial(['{"id":1,"ok":true,"data":{"pong":true}}\n'])
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.activity.errors"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        session_dir = self._make_test_dir("activity_errors") / "session"
+        service.start_activity_session(output_dir=session_dir, include_map=False)
+
+        with self.assertRaises(ValueError):
+            service.distance_sensor.get(3)
+
+        summary = service.stop_activity_session()
+        self.assertIsNone(summary["route_path"])
+        actions_text = (session_dir / "actions.txt").read_text(encoding="utf-8")
+        self.assertIn("Не удалось получить расстояние с датчика 3", actions_text)
+        self.assertIn("| ERROR |", actions_text)
+
+        events = json.loads((session_dir / "events.json").read_text(encoding="utf-8"))
+        error_events = [event for event in events if event["action"] == "distance_sensor.get" and not event["success"]]
+        self.assertEqual(len(error_events), 1)
+        self.assertEqual(error_events[0]["error_type"], "ValueError")
+
+        service.close()
+
+    @patch("raspberry.arduino_service.time.sleep", return_value=None)
+    def test_align_parallel_to_wall_records_summary_event(self, _sleep) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"distance_mm":140}}\n',
+                '{"id":3,"ok":true,"data":{"distance_mm":100}}\n',
+                '{"id":4,"ok":true,"data":{"target":"left","pwm":20}}\n',
+                '{"id":5,"ok":true,"data":{"target":"right","pwm":-20}}\n',
+                '{"id":6,"ok":true,"data":{"stopped":true}}\n',
+                '{"id":7,"ok":true,"data":{"distance_mm":109}}\n',
+                '{"id":8,"ok":true,"data":{"distance_mm":104}}\n',
+            ]
+        )
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.activity.align"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        session_dir = self._make_test_dir("activity_align") / "session"
+        service.start_activity_session(output_dir=session_dir, include_map=False)
+        service.align_parallel_to_wall(
+            front_sensor_id=1,
+            rear_sensor_id=2,
+            wall_side="right",
+            tolerance_mm=8.0,
+            turn_power=20,
+            pulse_seconds=0.1,
+            settle_seconds=0.02,
+            max_iterations=3,
+        )
+        service.stop_activity_session()
+
+        actions_text = (session_dir / "actions.txt").read_text(encoding="utf-8")
+        self.assertIn("Робот выровнился по правой стене с погрешностью не более 8.0 мм — Удачно", actions_text)
+
+        events = json.loads((session_dir / "events.json").read_text(encoding="utf-8"))
+        align_events = [event for event in events if event["action"] == "align_parallel_to_wall"]
+        self.assertEqual(len(align_events), 1)
+        self.assertTrue(align_events[0]["success"])
+        self.assertEqual(align_events[0]["result"]["correction_steps"], 1)
+
+        service.close()
+
+    def test_activity_session_integrates_now_motion_until_stop_all(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"target":"all","pwm":50}}\n',
+                '{"id":3,"ok":true,"data":{"stopped":true}}\n',
+            ]
+        )
+        clock = FakeClock(start=100.0)
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.activity.now"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+            monotonic_clock=clock.now,
+        )
+
+        session_dir = self._make_test_dir("activity_now") / "session"
+        service.start_activity_session(
+            output_dir=session_dir,
+            calibration=MotionMapCalibration(
+                max_linear_speed_mm_per_sec=100.0,
+                max_turn_deg_per_sec=180.0,
+            ),
+        )
+        service.eng_all.pwm(50).now()
+        clock.advance(2.0)
+        service.stop_all()
+        summary = service.stop_activity_session()
+
+        self.assertAlmostEqual(summary["final_pose"]["x_mm"], 100.0, places=3)
+        self.assertAlmostEqual(summary["final_pose"]["y_mm"], 0.0, places=3)
+
+        service.close()
+
+    def test_no_activity_artifacts_created_when_recording_is_disabled(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"pong":true}}\n',
+            ]
+        )
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.activity.disabled"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        work_dir = self._make_test_dir("activity_disabled")
+        old_cwd = os.getcwd()
+        os.chdir(work_dir)
+        try:
+            service.ping()
+            self.assertFalse(service.activity_session_active)
+            self.assertFalse((work_dir / "logs" / "arduino_sessions").exists())
+        finally:
+            os.chdir(old_cwd)
+
         service.close()
 
 
