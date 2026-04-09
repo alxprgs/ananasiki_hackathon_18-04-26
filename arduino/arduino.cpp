@@ -1,0 +1,914 @@
+#include <Arduino.h>
+#include <Servo.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+namespace Config {
+constexpr unsigned long SERIAL_BAUD = 115200UL;
+constexpr unsigned long COMMAND_WATCHDOG_MS = 1500UL;
+constexpr unsigned long SENSOR_SAMPLE_INTERVAL_MS = 75UL;
+constexpr unsigned long SENSOR_STALE_MS = 500UL;
+constexpr unsigned long SENSOR_TRIGGER_PULSE_US = 10UL;
+constexpr unsigned long SENSOR_ECHO_TIMEOUT_US = 25000UL;
+constexpr unsigned long STEPPER_PULSE_HIGH_US = 10UL;
+constexpr long STEPPER_STEPS_PER_REV = 200L;
+constexpr bool SWAP_TRACK_MOTORS = false;
+constexpr bool LEFT_TRACK_INVERTED = false;
+constexpr bool RIGHT_TRACK_INVERTED = false;
+constexpr bool SERVO_ENABLED = true;
+constexpr bool RELAY_ENABLED = true;
+constexpr bool STEPPER_ENABLED = true;
+constexpr bool STEPPER_ENABLE_ACTIVE_LOW = true;
+constexpr uint8_t SENSOR1_TRIG_PIN = 2;
+constexpr uint8_t SENSOR1_ECHO_PIN = 3;
+constexpr uint8_t LEFT_DIR_PIN = 4;
+constexpr uint8_t LEFT_PWM_PIN = 5;
+constexpr uint8_t RIGHT_PWM_PIN = 6;
+constexpr uint8_t RIGHT_DIR_PIN = 7;
+constexpr uint8_t SENSOR2_TRIG_PIN = 8;
+constexpr uint8_t SENSOR2_ECHO_PIN = 9;
+constexpr uint8_t SERVO_PIN = 10;
+constexpr uint8_t RELAY_PIN = 11;
+constexpr uint8_t STEPPER_STEP_PIN = 12;
+constexpr uint8_t STEPPER_DIR_PIN = 13;
+constexpr uint8_t STEPPER_ENABLE_PIN = A0;
+constexpr uint8_t BUTTON_PIN = A1;
+}  // namespace Config
+
+enum SensorStage : uint8_t {
+  SENSOR_IDLE = 0,
+  SENSOR_TRIGGER_HIGH = 1,
+  SENSOR_WAIT_ECHO_HIGH = 2,
+  SENSOR_WAIT_ECHO_LOW = 3
+};
+
+struct MotorPins {
+  uint8_t dirPin;
+  uint8_t pwmPin;
+  bool invertDirection;
+};
+
+struct DistanceSensorState {
+  uint8_t trigPin;
+  uint8_t echoPin;
+  SensorStage stage;
+  bool valid;
+  long lastDistanceMm;
+  unsigned long stageStartedUs;
+  unsigned long echoStartedUs;
+  unsigned long nextTriggerAtMs;
+  unsigned long lastSuccessAtMs;
+};
+
+struct MotorRuntimeState {
+  int currentPercent;
+  bool timed;
+  unsigned long stopAtMs;
+};
+
+struct StepperRuntimeState {
+  bool running;
+  bool stepPinHigh;
+  bool hasDeadline;
+  bool hasStepLimit;
+  long stepsRemaining;
+  unsigned long stopAtMs;
+  unsigned long lastPulseUs;
+  unsigned long stepIntervalUs;
+};
+
+constexpr size_t REQUEST_BUFFER_SIZE = 220;
+char gRequestBuffer[REQUEST_BUFFER_SIZE];
+size_t gRequestLength = 0;
+bool gRequestOverflow = false;
+
+DistanceSensorState gSensors[2] = {
+    {Config::SENSOR1_TRIG_PIN, Config::SENSOR1_ECHO_PIN, SENSOR_IDLE, false, 0, 0, 0, 0, 0, 0},
+    {Config::SENSOR2_TRIG_PIN, Config::SENSOR2_ECHO_PIN, SENSOR_IDLE, false, 0, 0, 0, 0, 0, 0},
+};
+int gActiveSensorIndex = -1;
+int gNextSensorIndex = 0;
+
+MotorRuntimeState gLeftMotor = {0, false, 0};
+MotorRuntimeState gRightMotor = {0, false, 0};
+
+StepperRuntimeState gStepper = {false, false, false, false, 0, 0, 0, 0};
+
+Servo gServo;
+bool gServoAttached = false;
+int gServoAngle = 90;
+bool gRelayEnabled = false;
+unsigned long gLastValidCommandAtMs = 0;
+bool gWatchdogTriggered = false;
+
+const MotorPins LEFT_MOTOR_PINS = {Config::LEFT_DIR_PIN, Config::LEFT_PWM_PIN, Config::LEFT_TRACK_INVERTED};
+const MotorPins RIGHT_MOTOR_PINS = {Config::RIGHT_DIR_PIN, Config::RIGHT_PWM_PIN, Config::RIGHT_TRACK_INVERTED};
+
+const MotorPins& leftMotorPins() {
+  return Config::SWAP_TRACK_MOTORS ? RIGHT_MOTOR_PINS : LEFT_MOTOR_PINS;
+}
+
+const MotorPins& rightMotorPins() {
+  return Config::SWAP_TRACK_MOTORS ? LEFT_MOTOR_PINS : RIGHT_MOTOR_PINS;
+}
+
+bool hasElapsed(unsigned long nowValue, unsigned long deadlineValue) {
+  return static_cast<long>(nowValue - deadlineValue) >= 0;
+}
+
+int clampPercent(long value) {
+  if (value > 100L) {
+    return 100;
+  }
+  if (value < -100L) {
+    return -100;
+  }
+  return static_cast<int>(value);
+}
+
+unsigned long pwmToDutyCycle(int percent) {
+  unsigned long absolutePercent = static_cast<unsigned long>(abs(percent));
+  return (absolutePercent * 255UL) / 100UL;
+}
+
+void printBool(bool value) {
+  Serial.print(value ? F("true") : F("false"));
+}
+
+void sendErrorResponse(long requestId, const char* code, const char* message) {
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.print(F(",\"ok\":false,\"error\":{\"code\":\""));
+  Serial.print(code);
+  Serial.print(F("\",\"message\":\""));
+  Serial.print(message);
+  Serial.println(F("\"}}"));
+}
+
+void sendEmptyOkResponse(long requestId) {
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.println(F(",\"ok\":true,\"data\":{}}"));
+}
+
+bool findFieldValue(const char* payload, const char* key, const char*& valueStart) {
+  char pattern[32];
+  int length = snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+  if (length <= 0 || length >= static_cast<int>(sizeof(pattern))) {
+    return false;
+  }
+  const char* found = strstr(payload, pattern);
+  if (found == nullptr) {
+    return false;
+  }
+  valueStart = found + length;
+  while (*valueStart == ' ') {
+    ++valueStart;
+  }
+  return true;
+}
+
+bool extractNumberToken(const char* payload, const char* key, char* out, size_t outSize) {
+  const char* start = nullptr;
+  if (!findFieldValue(payload, key, start)) {
+    return false;
+  }
+  size_t index = 0;
+  while (*start != '\0' && *start != ',' && *start != '}' && *start != ']') {
+    if (index + 1 >= outSize) {
+      return false;
+    }
+    out[index++] = *start;
+    ++start;
+  }
+  out[index] = '\0';
+  return index > 0;
+}
+
+bool extractLongField(const char* payload, const char* key, long& value) {
+  char token[24];
+  if (!extractNumberToken(payload, key, token, sizeof(token))) {
+    return false;
+  }
+  char* endPtr = nullptr;
+  long parsed = strtol(token, &endPtr, 10);
+  if (endPtr == token) {
+    return false;
+  }
+  value = parsed;
+  return true;
+}
+
+bool extractDoubleField(const char* payload, const char* key, double& value) {
+  char token[24];
+  if (!extractNumberToken(payload, key, token, sizeof(token))) {
+    return false;
+  }
+  value = atof(token);
+  return true;
+}
+
+bool extractBoolField(const char* payload, const char* key, bool& value) {
+  const char* start = nullptr;
+  if (!findFieldValue(payload, key, start)) {
+    return false;
+  }
+  if (strncmp(start, "true", 4) == 0) {
+    value = true;
+    return true;
+  }
+  if (strncmp(start, "false", 5) == 0) {
+    value = false;
+    return true;
+  }
+  return false;
+}
+
+bool extractStringField(const char* payload, const char* key, char* out, size_t outSize) {
+  const char* start = nullptr;
+  if (!findFieldValue(payload, key, start) || *start != '"') {
+    return false;
+  }
+  ++start;
+  size_t index = 0;
+  while (*start != '\0' && *start != '"') {
+    if (index + 1 >= outSize) {
+      return false;
+    }
+    out[index++] = *start;
+    ++start;
+  }
+  if (*start != '"') {
+    return false;
+  }
+  out[index] = '\0';
+  return true;
+}
+
+bool isButtonPressed() {
+  return digitalRead(Config::BUTTON_PIN) == LOW;
+}
+
+void applyMotorOutput(const MotorPins& pins, int percent) {
+  int boundedPercent = clampPercent(percent);
+  if (boundedPercent == 0) {
+    analogWrite(pins.pwmPin, 0);
+    return;
+  }
+
+  bool forward = boundedPercent > 0;
+  if (pins.invertDirection) {
+    forward = !forward;
+  }
+
+  digitalWrite(pins.dirPin, forward ? HIGH : LOW);
+  analogWrite(pins.pwmPin, pwmToDutyCycle(boundedPercent));
+}
+
+void stopStepper();
+
+void stopAllMotion() {
+  gLeftMotor.currentPercent = 0;
+  gLeftMotor.timed = false;
+  gLeftMotor.stopAtMs = 0;
+  gRightMotor.currentPercent = 0;
+  gRightMotor.timed = false;
+  gRightMotor.stopAtMs = 0;
+  applyMotorOutput(leftMotorPins(), 0);
+  applyMotorOutput(rightMotorPins(), 0);
+  stopStepper();
+}
+
+void setMotorState(MotorRuntimeState& state, const MotorPins& pins, int percent, long durationMs) {
+  state.currentPercent = clampPercent(percent);
+  if (durationMs > 0) {
+    state.timed = true;
+    state.stopAtMs = millis() + static_cast<unsigned long>(durationMs);
+  } else {
+    state.timed = false;
+    state.stopAtMs = 0;
+  }
+  applyMotorOutput(pins, state.currentPercent);
+}
+
+void setMotorCommand(const char* target, int percent, long durationMs) {
+  if (strcmp(target, "all") == 0) {
+    setMotorState(gLeftMotor, leftMotorPins(), percent, durationMs);
+    setMotorState(gRightMotor, rightMotorPins(), percent, durationMs);
+    return;
+  }
+  if (strcmp(target, "left") == 0) {
+    setMotorState(gLeftMotor, leftMotorPins(), percent, durationMs);
+    return;
+  }
+  if (strcmp(target, "right") == 0) {
+    setMotorState(gRightMotor, rightMotorPins(), percent, durationMs);
+    return;
+  }
+}
+
+void updateMotorTimers() {
+  unsigned long nowMs = millis();
+
+  if (gLeftMotor.timed && hasElapsed(nowMs, gLeftMotor.stopAtMs)) {
+    gLeftMotor.timed = false;
+    gLeftMotor.currentPercent = 0;
+    applyMotorOutput(leftMotorPins(), 0);
+  }
+
+  if (gRightMotor.timed && hasElapsed(nowMs, gRightMotor.stopAtMs)) {
+    gRightMotor.timed = false;
+    gRightMotor.currentPercent = 0;
+    applyMotorOutput(rightMotorPins(), 0);
+  }
+
+  if (!gWatchdogTriggered && hasElapsed(nowMs, gLastValidCommandAtMs + Config::COMMAND_WATCHDOG_MS)) {
+    stopAllMotion();
+    gWatchdogTriggered = true;
+  }
+}
+
+void enableStepperDriver(bool enabled) {
+  if (!Config::STEPPER_ENABLED) {
+    return;
+  }
+
+  bool outputState = enabled;
+  if (Config::STEPPER_ENABLE_ACTIVE_LOW) {
+    outputState = !enabled;
+  }
+  digitalWrite(Config::STEPPER_ENABLE_PIN, outputState ? HIGH : LOW);
+}
+
+void stopStepper() {
+  if (!Config::STEPPER_ENABLED) {
+    return;
+  }
+
+  gStepper.running = false;
+  gStepper.stepPinHigh = false;
+  gStepper.hasDeadline = false;
+  gStepper.hasStepLimit = false;
+  gStepper.stepsRemaining = 0;
+  digitalWrite(Config::STEPPER_STEP_PIN, LOW);
+  enableStepperDriver(false);
+}
+
+void startStepper(bool forward, unsigned long rpm, long steps, long durationMs) {
+  if (!Config::STEPPER_ENABLED) {
+    return;
+  }
+
+  enableStepperDriver(true);
+  digitalWrite(Config::STEPPER_DIR_PIN, forward ? HIGH : LOW);
+
+  unsigned long intervalUs = 60000000UL / (static_cast<unsigned long>(Config::STEPPER_STEPS_PER_REV) * rpm);
+  if (intervalUs < Config::STEPPER_PULSE_HIGH_US + 20UL) {
+    intervalUs = Config::STEPPER_PULSE_HIGH_US + 20UL;
+  }
+
+  gStepper.running = true;
+  gStepper.stepPinHigh = false;
+  gStepper.stepIntervalUs = intervalUs;
+  gStepper.lastPulseUs = micros();
+  gStepper.hasDeadline = durationMs > 0;
+  gStepper.stopAtMs = millis() + static_cast<unsigned long>(durationMs > 0 ? durationMs : 0);
+  gStepper.hasStepLimit = steps > 0;
+  gStepper.stepsRemaining = steps > 0 ? steps : 0;
+}
+
+void updateStepper() {
+  if (!Config::STEPPER_ENABLED || !gStepper.running) {
+    return;
+  }
+
+  unsigned long nowMs = millis();
+  unsigned long nowUs = micros();
+
+  if (gStepper.hasDeadline && hasElapsed(nowMs, gStepper.stopAtMs)) {
+    stopStepper();
+    return;
+  }
+
+  if (gStepper.stepPinHigh) {
+    if (hasElapsed(nowUs, gStepper.lastPulseUs + Config::STEPPER_PULSE_HIGH_US)) {
+      digitalWrite(Config::STEPPER_STEP_PIN, LOW);
+      gStepper.stepPinHigh = false;
+      gStepper.lastPulseUs = nowUs;
+      if (gStepper.hasStepLimit && gStepper.stepsRemaining <= 0) {
+        stopStepper();
+      }
+    }
+    return;
+  }
+
+  if (gStepper.hasStepLimit && gStepper.stepsRemaining <= 0) {
+    stopStepper();
+    return;
+  }
+
+  if (hasElapsed(nowUs, gStepper.lastPulseUs + gStepper.stepIntervalUs)) {
+    digitalWrite(Config::STEPPER_STEP_PIN, HIGH);
+    gStepper.stepPinHigh = true;
+    gStepper.lastPulseUs = nowUs;
+    if (gStepper.hasStepLimit && gStepper.stepsRemaining > 0) {
+      --gStepper.stepsRemaining;
+    }
+  }
+}
+
+void beginSensorCycle(DistanceSensorState& sensor) {
+  digitalWrite(sensor.trigPin, HIGH);
+  sensor.stage = SENSOR_TRIGGER_HIGH;
+  sensor.stageStartedUs = micros();
+}
+
+bool finishSensorCycle(DistanceSensorState& sensor, bool validMeasurement, long distanceMm) {
+  sensor.valid = validMeasurement;
+  if (validMeasurement) {
+    sensor.lastDistanceMm = distanceMm;
+    sensor.lastSuccessAtMs = millis();
+  }
+  sensor.stage = SENSOR_IDLE;
+  sensor.nextTriggerAtMs = millis() + Config::SENSOR_SAMPLE_INTERVAL_MS;
+  return true;
+}
+
+bool updateActiveSensor(DistanceSensorState& sensor) {
+  unsigned long nowUs = micros();
+
+  switch (sensor.stage) {
+    case SENSOR_TRIGGER_HIGH:
+      if (hasElapsed(nowUs, sensor.stageStartedUs + Config::SENSOR_TRIGGER_PULSE_US)) {
+        digitalWrite(sensor.trigPin, LOW);
+        sensor.stage = SENSOR_WAIT_ECHO_HIGH;
+        sensor.stageStartedUs = nowUs;
+      }
+      break;
+
+    case SENSOR_WAIT_ECHO_HIGH:
+      if (digitalRead(sensor.echoPin) == HIGH) {
+        sensor.echoStartedUs = nowUs;
+        sensor.stage = SENSOR_WAIT_ECHO_LOW;
+      } else if (hasElapsed(nowUs, sensor.stageStartedUs + Config::SENSOR_ECHO_TIMEOUT_US)) {
+        return finishSensorCycle(sensor, false, 0);
+      }
+      break;
+
+    case SENSOR_WAIT_ECHO_LOW:
+      if (digitalRead(sensor.echoPin) == LOW) {
+        unsigned long pulseWidthUs = nowUs - sensor.echoStartedUs;
+        long distanceMm = static_cast<long>((pulseWidthUs * 343UL) / 2000UL);
+        return finishSensorCycle(sensor, true, distanceMm);
+      }
+      if (hasElapsed(nowUs, sensor.echoStartedUs + Config::SENSOR_ECHO_TIMEOUT_US)) {
+        return finishSensorCycle(sensor, false, 0);
+      }
+      break;
+
+    case SENSOR_IDLE:
+    default:
+      return true;
+  }
+
+  return false;
+}
+
+void updateSensors() {
+  if (gActiveSensorIndex >= 0) {
+    if (updateActiveSensor(gSensors[gActiveSensorIndex])) {
+      gActiveSensorIndex = -1;
+    }
+    return;
+  }
+
+  unsigned long nowMs = millis();
+  for (uint8_t attempt = 0; attempt < 2; ++attempt) {
+    int candidate = (gNextSensorIndex + attempt) % 2;
+    if (hasElapsed(nowMs, gSensors[candidate].nextTriggerAtMs)) {
+      gActiveSensorIndex = candidate;
+      gNextSensorIndex = (candidate + 1) % 2;
+      beginSensorCycle(gSensors[candidate]);
+      return;
+    }
+  }
+}
+
+bool sensorDistanceAvailable(int sensorIndex, long& distanceMm) {
+  if (sensorIndex < 0 || sensorIndex >= 2) {
+    return false;
+  }
+  DistanceSensorState& sensor = gSensors[sensorIndex];
+  if (!sensor.valid) {
+    return false;
+  }
+  if (!hasElapsed(millis(), sensor.lastSuccessAtMs + Config::SENSOR_STALE_MS)) {
+    distanceMm = sensor.lastDistanceMm;
+    return true;
+  }
+  return false;
+}
+
+void sendStatusResponse(long requestId) {
+  long distance1 = 0;
+  long distance2 = 0;
+  bool sensor1Valid = sensorDistanceAvailable(0, distance1);
+  bool sensor2Valid = sensorDistanceAvailable(1, distance2);
+
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.print(F(",\"ok\":true,\"data\":{"));
+  Serial.print(F("\"button_pressed\":"));
+  printBool(isButtonPressed());
+  Serial.print(F(",\"left_pwm\":"));
+  Serial.print(gLeftMotor.currentPercent);
+  Serial.print(F(",\"right_pwm\":"));
+  Serial.print(gRightMotor.currentPercent);
+  Serial.print(F(",\"watchdog_ms\":"));
+  Serial.print(Config::COMMAND_WATCHDOG_MS);
+  Serial.print(F(",\"relay_enabled\":"));
+  printBool(gRelayEnabled);
+  Serial.print(F(",\"stepper_running\":"));
+  printBool(gStepper.running);
+  Serial.print(F(",\"features\":{\"servo\":"));
+  printBool(Config::SERVO_ENABLED);
+  Serial.print(F(",\"relay\":"));
+  printBool(Config::RELAY_ENABLED);
+  Serial.print(F(",\"stepper\":"));
+  printBool(Config::STEPPER_ENABLED);
+  Serial.print(F("},\"distance_mm\":{\"1\":"));
+  if (sensor1Valid) {
+    Serial.print(distance1);
+  } else {
+    Serial.print(F("null"));
+  }
+  Serial.print(F(",\"2\":"));
+  if (sensor2Valid) {
+    Serial.print(distance2);
+  } else {
+    Serial.print(F("null"));
+  }
+  Serial.println(F("}}}"));
+}
+
+void markCommandReceived() {
+  gLastValidCommandAtMs = millis();
+  gWatchdogTriggered = false;
+}
+
+void handlePing(long requestId) {
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.println(F(",\"ok\":true,\"data\":{\"pong\":true,\"firmware\":\"rescue_maze_low_level_v1\"}}"));
+}
+
+void handleDistanceRequest(long requestId, const char* payload) {
+  long sensorId = 0;
+  if (!extractLongField(payload, "sensor", sensorId) || sensorId < 1 || sensorId > 2) {
+    sendErrorResponse(requestId, "bad_request", "sensor должен быть равен 1 или 2");
+    return;
+  }
+
+  long distanceMm = 0;
+  if (!sensorDistanceAvailable(static_cast<int>(sensorId) - 1, distanceMm)) {
+    sendErrorResponse(requestId, "sensor_timeout", "измерение расстояния недоступно");
+    return;
+  }
+
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.print(F(",\"ok\":true,\"data\":{\"sensor\":"));
+  Serial.print(sensorId);
+  Serial.print(F(",\"distance_mm\":"));
+  Serial.print(distanceMm);
+  Serial.println(F("}}"));
+}
+
+void handleButtonRequest(long requestId) {
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.print(F(",\"ok\":true,\"data\":{\"pressed\":"));
+  printBool(isButtonPressed());
+  Serial.println(F("}}"));
+}
+
+void handleSetMotor(long requestId, const char* payload) {
+  char target[8];
+  long pwm = 0;
+  long durationMs = 0;
+
+  if (!extractStringField(payload, "target", target, sizeof(target))) {
+    sendErrorResponse(requestId, "bad_request", "поле target обязательно");
+    return;
+  }
+
+  if (strcmp(target, "all") != 0 && strcmp(target, "left") != 0 && strcmp(target, "right") != 0) {
+    sendErrorResponse(requestId, "bad_request", "target должен быть all, left или right");
+    return;
+  }
+
+  if (!extractLongField(payload, "pwm", pwm)) {
+    sendErrorResponse(requestId, "bad_request", "поле pwm обязательно");
+    return;
+  }
+
+  if (!extractLongField(payload, "duration_ms", durationMs)) {
+    durationMs = 0;
+  }
+  if (durationMs < 0) {
+    durationMs = 0;
+  }
+
+  setMotorCommand(target, clampPercent(pwm), durationMs);
+
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.print(F(",\"ok\":true,\"data\":{\"target\":\""));
+  Serial.print(target);
+  Serial.print(F("\",\"pwm\":"));
+  Serial.print(clampPercent(pwm));
+  Serial.print(F(",\"duration_ms\":"));
+  Serial.print(durationMs);
+  Serial.println(F("}}"));
+}
+
+void handleSetServo(long requestId, const char* payload) {
+  if (!Config::SERVO_ENABLED) {
+    sendErrorResponse(requestId, "unsupported", "сервопривод не настроен");
+    return;
+  }
+
+  long angle = 0;
+  if (!extractLongField(payload, "angle_deg", angle)) {
+    sendErrorResponse(requestId, "bad_request", "поле angle_deg обязательно");
+    return;
+  }
+
+  if (angle < 0) {
+    angle = 0;
+  } else if (angle > 180) {
+    angle = 180;
+  }
+
+  if (!gServoAttached) {
+    gServo.attach(Config::SERVO_PIN);
+    gServoAttached = true;
+  }
+
+  gServoAngle = static_cast<int>(angle);
+  gServo.write(gServoAngle);
+
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.print(F(",\"ok\":true,\"data\":{\"angle_deg\":"));
+  Serial.print(gServoAngle);
+  Serial.println(F("}}"));
+}
+
+void handleSetRelay(long requestId, const char* payload) {
+  if (!Config::RELAY_ENABLED) {
+    sendErrorResponse(requestId, "unsupported", "реле не настроено");
+    return;
+  }
+
+  bool enabled = false;
+  if (!extractBoolField(payload, "enabled", enabled)) {
+    sendErrorResponse(requestId, "bad_request", "поле enabled обязательно");
+    return;
+  }
+
+  gRelayEnabled = enabled;
+  digitalWrite(Config::RELAY_PIN, enabled ? HIGH : LOW);
+
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.print(F(",\"ok\":true,\"data\":{\"enabled\":"));
+  printBool(gRelayEnabled);
+  Serial.println(F("}}"));
+}
+
+void handleStepperMove(long requestId, const char* payload) {
+  if (!Config::STEPPER_ENABLED) {
+    sendErrorResponse(requestId, "unsupported", "шаговый двигатель не настроен");
+    return;
+  }
+
+  double rpmValue = 0.0;
+  if (!extractDoubleField(payload, "rpm", rpmValue) || rpmValue <= 0.0) {
+    sendErrorResponse(requestId, "bad_request", "rpm должно быть положительным");
+    return;
+  }
+
+  char direction[10];
+  if (!extractStringField(payload, "direction", direction, sizeof(direction))) {
+    strcpy(direction, "forward");
+  }
+
+  bool forward = true;
+  if (strcmp(direction, "forward") == 0) {
+    forward = true;
+  } else if (strcmp(direction, "reverse") == 0) {
+    forward = false;
+  } else {
+    sendErrorResponse(requestId, "bad_request", "direction должно быть forward или reverse");
+    return;
+  }
+
+  long steps = 0;
+  bool hasSteps = extractLongField(payload, "steps", steps);
+  if (hasSteps && steps < 0) {
+    steps = abs(steps);
+    forward = !forward;
+  }
+
+  long durationMs = 0;
+  if (!extractLongField(payload, "duration_ms", durationMs)) {
+    durationMs = 0;
+  }
+  if (durationMs < 0) {
+    durationMs = 0;
+  }
+
+  startStepper(forward, static_cast<unsigned long>(rpmValue), hasSteps ? steps : 0, durationMs);
+
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.print(F(",\"ok\":true,\"data\":{\"running\":"));
+  printBool(gStepper.running);
+  Serial.print(F(",\"rpm\":"));
+  Serial.print(rpmValue, 2);
+  Serial.print(F(",\"direction\":\""));
+  Serial.print(forward ? F("forward") : F("reverse"));
+  Serial.print(F("\",\"steps\":"));
+  if (hasSteps) {
+    Serial.print(steps);
+  } else {
+    Serial.print(F("null"));
+  }
+  Serial.print(F(",\"duration_ms\":"));
+  Serial.print(durationMs);
+  Serial.println(F("}}"));
+}
+
+void handleRequest(const char* payload) {
+  long requestId = 0;
+  char operation[20];
+
+  if (!extractLongField(payload, "id", requestId)) {
+    sendErrorResponse(0, "bad_request", "поле id обязательно");
+    return;
+  }
+
+  if (!extractStringField(payload, "op", operation, sizeof(operation))) {
+    sendErrorResponse(requestId, "bad_request", "поле op обязательно");
+    return;
+  }
+
+  markCommandReceived();
+
+  if (strcmp(operation, "ping") == 0) {
+    handlePing(requestId);
+    return;
+  }
+
+  if (strcmp(operation, "get_distance") == 0) {
+    handleDistanceRequest(requestId, payload);
+    return;
+  }
+
+  if (strcmp(operation, "get_button") == 0) {
+    handleButtonRequest(requestId);
+    return;
+  }
+
+  if (strcmp(operation, "set_motor") == 0) {
+    handleSetMotor(requestId, payload);
+    return;
+  }
+
+  if (strcmp(operation, "stop_all") == 0) {
+    stopAllMotion();
+    sendEmptyOkResponse(requestId);
+    return;
+  }
+
+  if (strcmp(operation, "get_status") == 0) {
+    sendStatusResponse(requestId);
+    return;
+  }
+
+  if (strcmp(operation, "set_servo") == 0) {
+    handleSetServo(requestId, payload);
+    return;
+  }
+
+  if (strcmp(operation, "set_relay") == 0) {
+    handleSetRelay(requestId, payload);
+    return;
+  }
+
+  if (strcmp(operation, "stepper_move") == 0) {
+    handleStepperMove(requestId, payload);
+    return;
+  }
+
+  if (strcmp(operation, "stepper_stop") == 0) {
+    if (!Config::STEPPER_ENABLED) {
+      sendErrorResponse(requestId, "unsupported", "шаговый двигатель не настроен");
+      return;
+    }
+    stopStepper();
+    sendEmptyOkResponse(requestId);
+    return;
+  }
+
+  sendErrorResponse(requestId, "unknown_op", "операция не поддерживается");
+}
+
+void readSerialRequests() {
+  while (Serial.available() > 0) {
+    char incoming = static_cast<char>(Serial.read());
+    if (incoming == '\r') {
+      continue;
+    }
+
+    if (incoming == '\n') {
+      if (gRequestOverflow) {
+        sendErrorResponse(0, "bad_request", "запрос слишком длинный");
+      } else if (gRequestLength > 0) {
+        gRequestBuffer[gRequestLength] = '\0';
+        handleRequest(gRequestBuffer);
+      }
+      gRequestLength = 0;
+      gRequestOverflow = false;
+      continue;
+    }
+
+    if (gRequestOverflow) {
+      continue;
+    }
+
+    if (gRequestLength + 1 >= REQUEST_BUFFER_SIZE) {
+      gRequestOverflow = true;
+      continue;
+    }
+
+    gRequestBuffer[gRequestLength++] = incoming;
+  }
+}
+
+void setupPins() {
+  pinMode(leftMotorPins().dirPin, OUTPUT);
+  pinMode(leftMotorPins().pwmPin, OUTPUT);
+  pinMode(rightMotorPins().dirPin, OUTPUT);
+  pinMode(rightMotorPins().pwmPin, OUTPUT);
+  digitalWrite(leftMotorPins().dirPin, LOW);
+  digitalWrite(rightMotorPins().dirPin, LOW);
+  analogWrite(leftMotorPins().pwmPin, 0);
+  analogWrite(rightMotorPins().pwmPin, 0);
+
+  for (uint8_t index = 0; index < 2; ++index) {
+    pinMode(gSensors[index].trigPin, OUTPUT);
+    pinMode(gSensors[index].echoPin, INPUT);
+    digitalWrite(gSensors[index].trigPin, LOW);
+    gSensors[index].stage = SENSOR_IDLE;
+    gSensors[index].nextTriggerAtMs = millis() + (index * Config::SENSOR_SAMPLE_INTERVAL_MS);
+  }
+
+  pinMode(Config::BUTTON_PIN, INPUT_PULLUP);
+
+  if (Config::SERVO_ENABLED) {
+    gServo.attach(Config::SERVO_PIN);
+    gServo.write(gServoAngle);
+    gServoAttached = true;
+  }
+
+  if (Config::RELAY_ENABLED) {
+    pinMode(Config::RELAY_PIN, OUTPUT);
+    digitalWrite(Config::RELAY_PIN, LOW);
+    gRelayEnabled = false;
+  }
+
+  if (Config::STEPPER_ENABLED) {
+    pinMode(Config::STEPPER_STEP_PIN, OUTPUT);
+    pinMode(Config::STEPPER_DIR_PIN, OUTPUT);
+    pinMode(Config::STEPPER_ENABLE_PIN, OUTPUT);
+    digitalWrite(Config::STEPPER_STEP_PIN, LOW);
+    digitalWrite(Config::STEPPER_DIR_PIN, LOW);
+    enableStepperDriver(false);
+  }
+}
+
+void setup() {
+  Serial.begin(Config::SERIAL_BAUD);
+  setupPins();
+  gLastValidCommandAtMs = millis();
+}
+
+void loop() {
+  readSerialRequests();
+  updateSensors();
+  updateMotorTimers();
+  updateStepper();
+}
