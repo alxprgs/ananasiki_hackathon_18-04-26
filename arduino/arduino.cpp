@@ -4,7 +4,50 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * Низкоуровневая прошивка для Rescue Maze робота.
+ *
+ * Архитектура здесь двухуровневая:
+ * - Raspberry Pi отвечает за "умную" часть, сценарии, высокоуровневую логику и
+ *   отправку команд;
+ * - Arduino занимается только железом и выполняет команды максимально быстро и
+ *   предсказуемо.
+ *
+ * Как идёт обмен:
+ * - Raspberry Pi отправляет одну JSON-команду в одну строку;
+ * - Arduino читает строку до '\n', выполняет команду и возвращает один JSON-ответ;
+ * - такой протокол удобно отлаживать и из Python, и вручную через Serial Monitor.
+ *
+ * Почему здесь почти нет блокирующих задержек:
+ * - робот не должен "замирать" на чтении датчика или шаговика и переставать
+ *   обрабатывать команды;
+ * - поэтому датчики, timed-моторы и stepper обновляются малыми шагами в loop().
+ *
+ * Что проверить в первую очередь, если прошивка "не работает":
+ * 1. Совпадает ли SERIAL_BAUD с настройкой на Raspberry Pi.
+ * 2. Действительно ли каждая команда заканчивается переводом строки '\n'.
+ * 3. Верна ли распиновка в namespace Config.
+ * 4. Не перепутаны ли левый и правый моторы.
+ * 5. Не нужно ли инвертировать направление одного из моторов.
+ * 6. Есть ли общая земля между всеми модулями.
+ * 7. Хватает ли питания моторам, серве, ультразвуку и stepper driver.
+ */
+
 namespace Config {
+/*
+ * Весь конфиг собран в одном месте специально, чтобы не искать "магические числа"
+ * по всей прошивке. Если меняется шасси, Motor Shield или пины, почти всегда
+ * достаточно править только этот блок.
+ *
+ * Ключевые флаги для отладки:
+ * - SWAP_TRACK_MOTORS:
+ *   если команды left/right физически попали на противоположные гусеницы.
+ * - LEFT_TRACK_INVERTED / RIGHT_TRACK_INVERTED:
+ *   если мотор при положительной команде едет не вперёд, а назад.
+ * - SERVO_ENABLED / RELAY_ENABLED / STEPPER_ENABLED:
+ *   позволяют быстро отключить опциональное оборудование, не ломая остальную
+ *   прошивку.
+ */
 constexpr unsigned long SERIAL_BAUD = 115200UL;
 constexpr unsigned long COMMAND_WATCHDOG_MS = 1500UL;
 constexpr unsigned long SENSOR_SAMPLE_INTERVAL_MS = 75UL;
@@ -36,6 +79,18 @@ constexpr uint8_t STEPPER_ENABLE_PIN = A0;
 constexpr uint8_t BUTTON_PIN = A1;
 }  // namespace Config
 
+/*
+ * Этапы опроса ультразвукового датчика.
+ *
+ * Мы не используем pulseIn(), потому что это блокирующая функция. Вместо этого
+ * датчик проходит через небольшой конечный автомат:
+ * - подняли trig;
+ * - дождались нужной длины импульса;
+ * - ждём начала echo;
+ * - ждём завершения echo.
+ *
+ * Благодаря этому прошивка остаётся отзывчивой и продолжает принимать команды.
+ */
 enum SensorStage : uint8_t {
   SENSOR_IDLE = 0,
   SENSOR_TRIGGER_HIGH = 1,
@@ -49,6 +104,19 @@ struct MotorPins {
   bool invertDirection;
 };
 
+/*
+ * Состояние одного ультразвукового датчика.
+ *
+ * Здесь хранятся:
+ * - аппаратные пины;
+ * - текущая стадия измерения;
+ * - флаг валидности последнего измерения;
+ * - последнее расстояние;
+ * - временные метки для неблокирующего автомата.
+ *
+ * Это позволяет не просто "замерить расстояние", а понимать, насколько свежие
+ * данные сейчас лежат в памяти и можно ли их отдавать наружу.
+ */
 struct DistanceSensorState {
   uint8_t trigPin;
   uint8_t echoPin;
@@ -61,12 +129,22 @@ struct DistanceSensorState {
   unsigned long lastSuccessAtMs;
 };
 
+// Текущее состояние одного DC-мотора и опциональный дедлайн timed-команды.
 struct MotorRuntimeState {
   int currentPercent;
   bool timed;
   unsigned long stopAtMs;
 };
 
+/*
+ * Состояние stepper driver.
+ *
+ * Здесь мы отслеживаем не только факт "крутится / не крутится", но и:
+ * - ограничение по шагам;
+ * - ограничение по времени;
+ * - состояние STEP-пина;
+ * - интервал между шагами.
+ */
 struct StepperRuntimeState {
   bool running;
   bool stepPinHigh;
@@ -83,6 +161,7 @@ char gRequestBuffer[REQUEST_BUFFER_SIZE];
 size_t gRequestLength = 0;
 bool gRequestOverflow = false;
 
+// Два датчика живут в массиве, так как их логика полностью одинакова.
 DistanceSensorState gSensors[2] = {
     {Config::SENSOR1_TRIG_PIN, Config::SENSOR1_ECHO_PIN, SENSOR_IDLE, false, 0, 0, 0, 0, 0, 0},
     {Config::SENSOR2_TRIG_PIN, Config::SENSOR2_ECHO_PIN, SENSOR_IDLE, false, 0, 0, 0, 0, 0, 0},
@@ -105,6 +184,7 @@ bool gWatchdogTriggered = false;
 const MotorPins LEFT_MOTOR_PINS = {Config::LEFT_DIR_PIN, Config::LEFT_PWM_PIN, Config::LEFT_TRACK_INVERTED};
 const MotorPins RIGHT_MOTOR_PINS = {Config::RIGHT_DIR_PIN, Config::RIGHT_PWM_PIN, Config::RIGHT_TRACK_INVERTED};
 
+// Позволяет одной настройкой поменять местами левый и правый моторный канал.
 const MotorPins& leftMotorPins() {
   return Config::SWAP_TRACK_MOTORS ? RIGHT_MOTOR_PINS : LEFT_MOTOR_PINS;
 }
@@ -113,10 +193,12 @@ const MotorPins& rightMotorPins() {
   return Config::SWAP_TRACK_MOTORS ? LEFT_MOTOR_PINS : RIGHT_MOTOR_PINS;
 }
 
+// Безопасная проверка дедлайна, устойчивая к переполнению millis()/micros().
 bool hasElapsed(unsigned long nowValue, unsigned long deadlineValue) {
   return static_cast<long>(nowValue - deadlineValue) >= 0;
 }
 
+// Все команды мощности насильно ограничиваем диапазоном -100..100 процентов.
 int clampPercent(long value) {
   if (value > 100L) {
     return 100;
@@ -127,15 +209,23 @@ int clampPercent(long value) {
   return static_cast<int>(value);
 }
 
+// Переводим "проценты" в реальный PWM 0..255, который понимает analogWrite().
 unsigned long pwmToDutyCycle(int percent) {
   unsigned long absolutePercent = static_cast<unsigned long>(abs(percent));
   return (absolutePercent * 255UL) / 100UL;
 }
 
+// Маленькая утилита для сериализации bool в JSON без внешних библиотек.
 void printBool(bool value) {
   Serial.print(value ? F("true") : F("false"));
 }
 
+/*
+ * Формирование ответа об ошибке.
+ *
+ * Поля code и message нужны не только для человека, но и для Raspberry Pi:
+ * python-сервис может различать unsupported, bad_request и другие ситуации.
+ */
 void sendErrorResponse(long requestId, const char* code, const char* message) {
   Serial.print(F("{\"id\":"));
   Serial.print(requestId);
@@ -146,12 +236,20 @@ void sendErrorResponse(long requestId, const char* code, const char* message) {
   Serial.println(F("\"}}"));
 }
 
+// Упрощённый успешный ответ для команд, которым не нужно возвращать данные.
 void sendEmptyOkResponse(long requestId) {
   Serial.print(F("{\"id\":"));
   Serial.print(requestId);
   Serial.println(F(",\"ok\":true,\"data\":{}}"));
 }
 
+/*
+ * Ниже идёт очень лёгкий "ручной" разбор JSON.
+ *
+ * Важно понимать: это не универсальный парсер JSON, а минималистичный набор
+ * функций под строго контролируемый формат сообщений от Raspberry Pi.
+ * Для AVR это выгодно по памяти и по предсказуемости поведения.
+ */
 bool findFieldValue(const char* payload, const char* key, const char*& valueStart) {
   char pattern[32];
   int length = snprintf(pattern, sizeof(pattern), "\"%s\":", key);
@@ -169,6 +267,7 @@ bool findFieldValue(const char* payload, const char* key, const char*& valueStar
   return true;
 }
 
+// Вытаскивает "сырой" токен числа, чтобы потом преобразовать его в long или double.
 bool extractNumberToken(const char* payload, const char* key, char* out, size_t outSize) {
   const char* start = nullptr;
   if (!findFieldValue(payload, key, start)) {
@@ -186,6 +285,7 @@ bool extractNumberToken(const char* payload, const char* key, char* out, size_t 
   return index > 0;
 }
 
+// Извлечение целого числа из JSON-поля.
 bool extractLongField(const char* payload, const char* key, long& value) {
   char token[24];
   if (!extractNumberToken(payload, key, token, sizeof(token))) {
@@ -200,6 +300,7 @@ bool extractLongField(const char* payload, const char* key, long& value) {
   return true;
 }
 
+// Извлечение числа с плавающей точкой. Нужен в первую очередь для rpm шаговика.
 bool extractDoubleField(const char* payload, const char* key, double& value) {
   char token[24];
   if (!extractNumberToken(payload, key, token, sizeof(token))) {
@@ -209,6 +310,7 @@ bool extractDoubleField(const char* payload, const char* key, double& value) {
   return true;
 }
 
+// Извлечение bool в формате true/false.
 bool extractBoolField(const char* payload, const char* key, bool& value) {
   const char* start = nullptr;
   if (!findFieldValue(payload, key, start)) {
@@ -225,6 +327,7 @@ bool extractBoolField(const char* payload, const char* key, bool& value) {
   return false;
 }
 
+// Извлечение строки без полноценной обработки escape-последовательностей.
 bool extractStringField(const char* payload, const char* key, char* out, size_t outSize) {
   const char* start = nullptr;
   if (!findFieldValue(payload, key, start) || *start != '"') {
@@ -246,10 +349,17 @@ bool extractStringField(const char* payload, const char* key, char* out, size_t 
   return true;
 }
 
+// Кнопка подключена как INPUT_PULLUP, поэтому LOW означает "нажата".
 bool isButtonPressed() {
   return digitalRead(Config::BUTTON_PIN) == LOW;
 }
 
+/*
+ * Непосредственное применение команды к мотору.
+ *
+ * Если мотор крутится "не туда", править нужно не эту функцию, а флаг
+ * invertDirection в конфигурации конкретного канала.
+ */
 void applyMotorOutput(const MotorPins& pins, int percent) {
   int boundedPercent = clampPercent(percent);
   if (boundedPercent == 0) {
@@ -268,6 +378,7 @@ void applyMotorOutput(const MotorPins& pins, int percent) {
 
 void stopStepper();
 
+// Полная остановка всех исполнительных механизмов, которые могут двигать робота.
 void stopAllMotion() {
   gLeftMotor.currentPercent = 0;
   gLeftMotor.timed = false;
@@ -280,6 +391,7 @@ void stopAllMotion() {
   stopStepper();
 }
 
+// Запоминаем новое состояние моторного канала и сразу применяем его к железу.
 void setMotorState(MotorRuntimeState& state, const MotorPins& pins, int percent, long durationMs) {
   state.currentPercent = clampPercent(percent);
   if (durationMs > 0) {
@@ -292,6 +404,7 @@ void setMotorState(MotorRuntimeState& state, const MotorPins& pins, int percent,
   applyMotorOutput(pins, state.currentPercent);
 }
 
+// Разводим high-level команду по одному или двум каналам.
 void setMotorCommand(const char* target, int percent, long durationMs) {
   if (strcmp(target, "all") == 0) {
     setMotorState(gLeftMotor, leftMotorPins(), percent, durationMs);
@@ -308,6 +421,11 @@ void setMotorCommand(const char* target, int percent, long durationMs) {
   }
 }
 
+/*
+ * Здесь живут две важные вещи:
+ * - автоостановка timed-команд;
+ * - watchdog, который спасает от "вечного" движения при обрыве связи.
+ */
 void updateMotorTimers() {
   unsigned long nowMs = millis();
 
@@ -329,6 +447,7 @@ void updateMotorTimers() {
   }
 }
 
+// Унифицированное управление линией ENABLE у stepper driver.
 void enableStepperDriver(bool enabled) {
   if (!Config::STEPPER_ENABLED) {
     return;
@@ -341,6 +460,7 @@ void enableStepperDriver(bool enabled) {
   digitalWrite(Config::STEPPER_ENABLE_PIN, outputState ? HIGH : LOW);
 }
 
+// Безопасная остановка шагового двигателя и перевод драйвера в покой.
 void stopStepper() {
   if (!Config::STEPPER_ENABLED) {
     return;
@@ -355,6 +475,15 @@ void stopStepper() {
   enableStepperDriver(false);
 }
 
+/*
+ * Подготовка stepper driver к работе.
+ *
+ * Если шаговик дёргается, но не крутится стабильно, обычно проблема одна из этих:
+ * - слишком большой rpm;
+ * - перепутаны STEP/DIR;
+ * - неверная логика ENABLE;
+ * - недостаток питания драйвера или мотора.
+ */
 void startStepper(bool forward, unsigned long rpm, long steps, long durationMs) {
   if (!Config::STEPPER_ENABLED) {
     return;
@@ -378,6 +507,12 @@ void startStepper(bool forward, unsigned long rpm, long steps, long durationMs) 
   gStepper.stepsRemaining = steps > 0 ? steps : 0;
 }
 
+/*
+ * Неблокирующее "тикание" шаговика.
+ *
+ * STEP поднимается и опускается как отдельные фазы, чтобы импульс имел нужную
+ * длительность и не ломал тайминг драйвера.
+ */
 void updateStepper() {
   if (!Config::STEPPER_ENABLED || !gStepper.running) {
     return;
@@ -418,12 +553,14 @@ void updateStepper() {
   }
 }
 
+// Стартуем очередное измерение ультразвуковым датчиком.
 void beginSensorCycle(DistanceSensorState& sensor) {
   digitalWrite(sensor.trigPin, HIGH);
   sensor.stage = SENSOR_TRIGGER_HIGH;
   sensor.stageStartedUs = micros();
 }
 
+// Завершаем цикл измерения и сохраняем результат только если он валиден.
 bool finishSensorCycle(DistanceSensorState& sensor, bool validMeasurement, long distanceMm) {
   sensor.valid = validMeasurement;
   if (validMeasurement) {
@@ -435,6 +572,13 @@ bool finishSensorCycle(DistanceSensorState& sensor, bool validMeasurement, long 
   return true;
 }
 
+/*
+ * Пошаговый опрос активного ультразвукового датчика.
+ *
+ * Формула расстояния:
+ * - скорость звука примерно 343 м/с;
+ * - echo проходит путь туда и обратно, поэтому делим на два.
+ */
 bool updateActiveSensor(DistanceSensorState& sensor) {
   unsigned long nowUs = micros();
 
@@ -475,6 +619,11 @@ bool updateActiveSensor(DistanceSensorState& sensor) {
   return false;
 }
 
+/*
+ * Два датчика запускаются по очереди, а не одновременно.
+ *
+ * Это уменьшает вероятность того, что один HC-SR04 поймает echo от другого.
+ */
 void updateSensors() {
   if (gActiveSensorIndex >= 0) {
     if (updateActiveSensor(gSensors[gActiveSensorIndex])) {
@@ -495,6 +644,7 @@ void updateSensors() {
   }
 }
 
+// Возвращаем расстояние только если последнее измерение ещё не считается устаревшим.
 bool sensorDistanceAvailable(int sensorIndex, long& distanceMm) {
   if (sensorIndex < 0 || sensorIndex >= 2) {
     return false;
@@ -510,6 +660,7 @@ bool sensorDistanceAvailable(int sensorIndex, long& distanceMm) {
   return false;
 }
 
+// Сводный статус нужен для быстрой диагностики без отдельного вызова каждого датчика.
 void sendStatusResponse(long requestId) {
   long distance1 = 0;
   long distance2 = 0;
@@ -552,17 +703,20 @@ void sendStatusResponse(long requestId) {
   Serial.println(F("}}}"));
 }
 
+// Сброс watchdog-таймера после любой корректно распознанной команды.
 void markCommandReceived() {
   gLastValidCommandAtMs = millis();
   gWatchdogTriggered = false;
 }
 
+// ping помогает Raspberry Pi убедиться, что на порту действительно наша прошивка.
 void handlePing(long requestId) {
   Serial.print(F("{\"id\":"));
   Serial.print(requestId);
   Serial.println(F(",\"ok\":true,\"data\":{\"pong\":true,\"firmware\":\"rescue_maze_low_level_v1\"}}"));
 }
 
+// Отдаём только одно конкретное расстояние, чтобы транспортный протокол был простым.
 void handleDistanceRequest(long requestId, const char* payload) {
   long sensorId = 0;
   if (!extractLongField(payload, "sensor", sensorId) || sensorId < 1 || sensorId > 2) {
@@ -585,6 +739,7 @@ void handleDistanceRequest(long requestId, const char* payload) {
   Serial.println(F("}}"));
 }
 
+// Состояние кнопки читается мгновенно и не требует отдельного автомата.
 void handleButtonRequest(long requestId) {
   Serial.print(F("{\"id\":"));
   Serial.print(requestId);
@@ -593,6 +748,13 @@ void handleButtonRequest(long requestId) {
   Serial.println(F("}}"));
 }
 
+/*
+ * Базовая команда для движения гусениц.
+ *
+ * duration_ms опционален:
+ * - если он > 0, Arduino сама остановит мотор позже;
+ * - если его нет, команда действует до следующего изменения состояния.
+ */
 void handleSetMotor(long requestId, const char* payload) {
   char target[8];
   long pwm = 0;
@@ -633,6 +795,7 @@ void handleSetMotor(long requestId, const char* payload) {
   Serial.println(F("}}"));
 }
 
+// Управление сервой вынесено отдельно, чтобы можно было честно вернуть unsupported.
 void handleSetServo(long requestId, const char* payload) {
   if (!Config::SERVO_ENABLED) {
     sendErrorResponse(requestId, "unsupported", "сервопривод не настроен");
@@ -666,6 +829,7 @@ void handleSetServo(long requestId, const char* payload) {
   Serial.println(F("}}"));
 }
 
+// Управление реле бинарное: либо включено, либо выключено.
 void handleSetRelay(long requestId, const char* payload) {
   if (!Config::RELAY_ENABLED) {
     sendErrorResponse(requestId, "unsupported", "реле не настроено");
@@ -688,6 +852,12 @@ void handleSetRelay(long requestId, const char* payload) {
   Serial.println(F("}}"));
 }
 
+/*
+ * Запуск шаговика с параметрами из JSON.
+ *
+ * Если steps отрицательный, логика специально разворачивает направление:
+ * это позволяет вызывать команду более гибко с Raspberry Pi.
+ */
 void handleStepperMove(long requestId, const char* payload) {
   if (!Config::STEPPER_ENABLED) {
     sendErrorResponse(requestId, "unsupported", "шаговый двигатель не настроен");
@@ -751,6 +921,14 @@ void handleStepperMove(long requestId, const char* payload) {
   Serial.println(F("}}"));
 }
 
+/*
+ * Центральный диспетчер протокола.
+ *
+ * При добавлении новой команды обычно нужно:
+ * - сделать новый handle...();
+ * - добавить ветку strcmp ниже;
+ * - при необходимости обновить get_status и python-сервис.
+ */
 void handleRequest(const char* payload) {
   long requestId = 0;
   char operation[20];
@@ -826,6 +1004,16 @@ void handleRequest(const char* payload) {
   sendErrorResponse(requestId, "unknown_op", "операция не поддерживается");
 }
 
+/*
+ * Построчное чтение serial-команд.
+ *
+ * Правило простое: одна команда занимает одну строку и обязательно завершается
+ * символом '\n'. Пока перевод строки не пришёл, Arduino считает, что команда ещё
+ * не закончена.
+ *
+ * Если Raspberry Pi пишет в порт без '\n', внешне это выглядит так, будто
+ * прошивка "не отвечает", хотя на самом деле она просто ждёт конец строки.
+ */
 void readSerialRequests() {
   while (Serial.available() > 0) {
     char incoming = static_cast<char>(Serial.read());
@@ -858,6 +1046,15 @@ void readSerialRequests() {
   }
 }
 
+/*
+ * Инициализация всех пинов в безопасное стартовое состояние.
+ *
+ * Если после прошивки что-то работает не так, проверять обычно нужно отсюда:
+ * - верна ли распиновка в Config;
+ * - на тех ли пинах сидят trig/echo;
+ * - не перепутаны ли dir/pwm у моторов;
+ * - не наоборот ли логика enable у stepper driver.
+ */
 void setupPins() {
   pinMode(leftMotorPins().dirPin, OUTPUT);
   pinMode(leftMotorPins().pwmPin, OUTPUT);
@@ -900,12 +1097,24 @@ void setupPins() {
   }
 }
 
+// setup() выполняется один раз после старта Arduino.
 void setup() {
   Serial.begin(Config::SERIAL_BAUD);
   setupPins();
   gLastValidCommandAtMs = millis();
 }
 
+/*
+ * Главный цикл прошивки.
+ *
+ * Порядок вызовов важен:
+ * - сначала читаем новые команды;
+ * - потом обновляем датчики;
+ * - затем timed-моторы и watchdog;
+ * - в конце шаговый двигатель.
+ *
+ * Здесь намеренно нет delay(), иначе робот начнёт "слепнуть" к новым командам.
+ */
 void loop() {
   readSerialRequests();
   updateSensors();
