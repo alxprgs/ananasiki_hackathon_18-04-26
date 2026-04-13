@@ -9,8 +9,8 @@ except ImportError:  # pragma: no cover - позволяет запускать 
     from raspberry_service import RaspberryService  # type: ignore[no-redef]
 
 def main():
-    robot = ArduinoService(port="COM3")
-    robot.eng_all().pwm(40).time(2)
+    with ArduinoService(port="COM3") as robot:
+        robot.eng_all.pwm(40).time(2)
 
 if __name__ == "__main__":  
     main()
