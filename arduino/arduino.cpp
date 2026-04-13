@@ -163,8 +163,8 @@ bool gRequestOverflow = false;
 
 // Два датчика живут в массиве, так как их логика полностью одинакова.
 DistanceSensorState gSensors[2] = {
-    {Config::SENSOR1_TRIG_PIN, Config::SENSOR1_ECHO_PIN, SENSOR_IDLE, false, 0, 0, 0, 0, 0, 0},
-    {Config::SENSOR2_TRIG_PIN, Config::SENSOR2_ECHO_PIN, SENSOR_IDLE, false, 0, 0, 0, 0, 0, 0},
+    {Config::SENSOR1_TRIG_PIN, Config::SENSOR1_ECHO_PIN, SENSOR_IDLE, false, 0, 0, 0, 0, 0},
+    {Config::SENSOR2_TRIG_PIN, Config::SENSOR2_ECHO_PIN, SENSOR_IDLE, false, 0, 0, 0, 0, 0},
 };
 int gActiveSensorIndex = -1;
 int gNextSensorIndex = 0;
