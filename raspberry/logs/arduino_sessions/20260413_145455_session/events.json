@@ -1,0 +1,96 @@
+[
+  {
+    "timestamp_iso": "2026-04-13T14:54:55.544+03:00",
+    "monotonic_seconds": 0.0,
+    "category": "session",
+    "action": "start_activity_session",
+    "success": true,
+    "text": "Сессия записи действий начата. Arduino подключена на порту COM3 — Выполнено",
+    "params": {
+      "output_dir": "logs\\arduino_sessions\\20260413_145455_session",
+      "session_name": null,
+      "include_map": true,
+      "calibration": {
+        "max_linear_speed_mm_per_sec": 320.0,
+        "max_turn_deg_per_sec": 180.0
+      }
+    },
+    "result": null,
+    "protocol_op": null,
+    "error_type": null,
+    "error_message": null,
+    "position": {
+      "x_mm": 0.0,
+      "y_mm": 0.0,
+      "heading_deg": 0.0
+    },
+    "route_label": "Старт сессии"
+  },
+  {
+    "timestamp_iso": "2026-04-13T14:54:55.560+03:00",
+    "monotonic_seconds": 0.016,
+    "category": "movement",
+    "action": "set_motor",
+    "success": true,
+    "text": "Робот проехал вперёд на команде 100% в течение 10.00 с — Выполнено",
+    "params": {
+      "target": "all",
+      "pwm": 100,
+      "duration_ms": 10000
+    },
+    "result": {
+      "target": "all",
+      "pwm": 100,
+      "duration_ms": 10000
+    },
+    "protocol_op": "set_motor",
+    "error_type": null,
+    "error_message": null,
+    "position": {
+      "x_mm": 0.0,
+      "y_mm": 0.0,
+      "heading_deg": 0.0
+    },
+    "route_label": "Робот: вперёд 100% 10.00с"
+  },
+  {
+    "timestamp_iso": "2026-04-13T14:55:05.561+03:00",
+    "monotonic_seconds": 10.016,
+    "category": "connection",
+    "action": "close",
+    "success": true,
+    "text": "Соединение с Arduino на порту COM3 закрыто — Выполнено",
+    "params": {
+      "port": "COM3"
+    },
+    "result": null,
+    "protocol_op": null,
+    "error_type": null,
+    "error_message": null,
+    "position": {
+      "x_mm": 3200.0,
+      "y_mm": 0.0,
+      "heading_deg": 0.0
+    },
+    "route_label": "Финиш"
+  },
+  {
+    "timestamp_iso": "2026-04-13T14:55:05.561+03:00",
+    "monotonic_seconds": 10.016,
+    "category": "session",
+    "action": "stop_activity_session",
+    "success": true,
+    "text": "Сессия записи действий завершена из-за закрытия сервиса — Выполнено",
+    "params": {},
+    "result": null,
+    "protocol_op": null,
+    "error_type": null,
+    "error_message": null,
+    "position": {
+      "x_mm": 3200.0,
+      "y_mm": 0.0,
+      "heading_deg": 0.0
+    },
+    "route_label": "Конец сессии"
+  }
+]
