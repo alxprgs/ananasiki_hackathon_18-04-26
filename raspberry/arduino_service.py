@@ -1185,29 +1185,16 @@ class ArduinoService:
 
         state = session.motion_state
         self._advance_motion_to(self._monotonic_now())
-        future_deadlines = [
-            deadline
-            for pwm, deadline in (
-                (state.left_pwm, state.left_auto_stop_at),
-                (state.right_pwm, state.right_auto_stop_at),
-            )
-            if pwm != 0 and deadline is not None and deadline > state.last_monotonic
-        ]
-        has_indefinite_motion = any(
-            pwm != 0 and deadline is None
-            for pwm, deadline in (
-                (state.left_pwm, state.left_auto_stop_at),
-                (state.right_pwm, state.right_auto_stop_at),
-            )
-        )
-        if future_deadlines and not has_indefinite_motion:
-            self._advance_motion_to(max(future_deadlines))
-
         state.left_pwm = 0
         state.right_pwm = 0
         state.left_auto_stop_at = None
         state.right_auto_stop_at = None
         self._append_route_point(label="Финиш")
+
+    def _wait_for_timed_completion(self, duration_ms: int) -> None:
+        if duration_ms <= 0:
+            return
+        time.sleep(duration_ms / 1000.0)
 
     def _apply_motor_command_to_activity(
         self,
@@ -1665,7 +1652,10 @@ class MotorCommandBuilder:
             ValueError: Если передана неположительная длительность.
             ArduinoProtocolError: Если команда отклонена.
         """
-        return self._send(duration_ms=_seconds_to_ms(seconds))
+        duration_ms = _seconds_to_ms(seconds)
+        response = self._send(duration_ms=duration_ms)
+        self._service._wait_for_timed_completion(duration_ms)
+        return response
 
     def now(self) -> dict[str, Any]:
         """Немедленно отправляет команду без ограничения по времени.
@@ -1759,12 +1749,15 @@ class StepperController:
             Словарь ``data`` из ответа Arduino.
         """
         duration_ms = _seconds_to_ms(duration) if duration is not None else None
-        return self._service.move_stepper(
+        response = self._service.move_stepper(
             steps=steps,
             rpm=rpm,
             direction=direction,
             duration_ms=duration_ms,
         )
+        if duration_ms is not None:
+            self._service._wait_for_timed_completion(duration_ms)
+        return response
 
     def stop(self) -> dict[str, Any]:
         """Останавливает шаговый двигатель и возвращает подтверждение Arduino."""

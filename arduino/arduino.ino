@@ -442,8 +442,28 @@ void updateMotorTimers() {
   }
 
   if (!gWatchdogTriggered && hasElapsed(nowMs, gLastValidCommandAtMs + Config::COMMAND_WATCHDOG_MS)) {
-    stopAllMotion();
-    gWatchdogTriggered = true;
+    bool stoppedUnsafeMotion = false;
+
+    if (!gLeftMotor.timed && gLeftMotor.currentPercent != 0) {
+      gLeftMotor.currentPercent = 0;
+      applyMotorOutput(leftMotorPins(), 0);
+      stoppedUnsafeMotion = true;
+    }
+
+    if (!gRightMotor.timed && gRightMotor.currentPercent != 0) {
+      gRightMotor.currentPercent = 0;
+      applyMotorOutput(rightMotorPins(), 0);
+      stoppedUnsafeMotion = true;
+    }
+
+    if (gStepper.running && !gStepper.hasDeadline && !gStepper.hasStepLimit) {
+      stopStepper();
+      stoppedUnsafeMotion = true;
+    }
+
+    if (stoppedUnsafeMotion) {
+      gWatchdogTriggered = true;
+    }
   }
 }
 

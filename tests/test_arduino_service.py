@@ -148,7 +148,8 @@ class ArduinoServiceTests(unittest.TestCase):
         self.assertAlmostEqual(service.distance_sensor.get(1, unit="m"), 0.345)
         service.close()
 
-    def test_timed_pwm_builder_sends_single_atomic_command(self) -> None:
+    @patch("raspberry.arduino_service.time.sleep", return_value=None)
+    def test_timed_pwm_builder_sends_single_atomic_command(self, sleep_mock) -> None:
         connection = FakeSerial(
             [
                 '{"id":1,"ok":true,"data":{"pong":true}}\n',
@@ -172,6 +173,7 @@ class ArduinoServiceTests(unittest.TestCase):
         self.assertEqual(payload["args"]["target"], "all")
         self.assertEqual(payload["args"]["pwm"], 55)
         self.assertEqual(payload["args"]["duration_ms"], 1500)
+        sleep_mock.assert_called_once_with(1.5)
         service.close()
 
     def test_requested_port_failure_raises_original_error(self) -> None:
@@ -383,7 +385,8 @@ class ArduinoServiceTests(unittest.TestCase):
         service.ping()
         service.button_status()
         service.distance_sensor.get(1, unit="cm")
-        service.eng_all.pwm(40).time(1.5)
+        with patch("raspberry.arduino_service.time.sleep", side_effect=lambda seconds: clock.advance(seconds)):
+            service.eng_all.pwm(40).time(1.5)
         summary = service.stop_activity_session()
 
         self.assertEqual(Path(summary["output_dir"]), session_dir)
@@ -405,6 +408,42 @@ class ArduinoServiceTests(unittest.TestCase):
         route_svg = (session_dir / "route.svg").read_text(encoding="utf-8")
         self.assertIn("Оценочная карта движения, не точная одометрия", route_svg)
         self.assertIn("polyline", route_svg)
+
+        service.close()
+
+    def test_activity_session_does_not_extrapolate_future_timed_motion_on_close(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"target":"all","pwm":40,"duration_ms":1500}}\n',
+            ]
+        )
+        clock = FakeClock(start=50.0)
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.activity.no_extrapolation"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+            monotonic_clock=clock.now,
+        )
+
+        session_dir = self._make_test_dir("activity_no_extrapolation") / "session"
+        service.start_activity_session(
+            output_dir=session_dir,
+            calibration=MotionMapCalibration(
+                max_linear_speed_mm_per_sec=200.0,
+                max_turn_deg_per_sec=180.0,
+            ),
+        )
+        service._send_motor_command(target="all", pwm=40, duration_ms=1500)
+        summary = service.stop_activity_session()
+
+        self.assertAlmostEqual(summary["final_pose"]["x_mm"], 0.0, places=3)
+
+        events = json.loads((session_dir / "events.json").read_text(encoding="utf-8"))
+        stop_event = next(event for event in events if event["action"] == "stop_activity_session")
+        self.assertAlmostEqual(stop_event["monotonic_seconds"], 0.0, places=3)
 
         service.close()
 
