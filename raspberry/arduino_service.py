@@ -1392,9 +1392,9 @@ class ArduinoService:
         if not self._motor_profile_enters_low_pwm_zone(start_pwm, stop_pwm):
             return
         self._logger.warning(
-            "Р”Р»СЏ ramp-РєРѕРјР°РЅРґС‹ РјРѕС‚РѕСЂР° %s Р·Р°РґР°РЅ РїСЂРѕС„РёР»СЊ PWM %s -> %s Р·Р° %.3f СЃ. "
-            "Р’ РґРёР°РїР°Р·РѕРЅРµ РЅРёР¶Рµ %s РґРІРёРіР°С‚РµР»СЊ РјРѕР¶РµС‚ СЂР°Р±РѕС‚Р°С‚СЊ РЅРµСЃС‚Р°Р±РёР»СЊРЅРѕ "
-            "РёР»Рё РІРѕРѕР±С‰Рµ РЅРµ Р·Р°РїСѓСЃС‚РёС‚СЊСЃСЏ РёР·-Р·Р° РЅР°РіСЂСѓР·РєРё, РїРёС‚Р°РЅРёСЏ РёР»Рё РґСЂР°Р№РІРµСЂР°.",
+            "Для ramp-команды мотора %s задан профиль PWM %s -> %s за %.3f с. "
+            "В диапазоне ниже %s двигатель может работать нестабильно "
+            "или вообще не запуститься из-за нагрузки, питания или драйвера.",
             target,
             start_pwm,
             stop_pwm,
@@ -1602,16 +1602,16 @@ class ArduinoService:
             if target == "all":
                 if duration_ms is not None:
                     return (
-                        f"Р РѕР±РѕС‚ РїСЂРѕРµС…Р°Р» {direction}{ramp_text} "
-                        f"РІ С‚РµС‡РµРЅРёРµ {duration_ms / 1000.0:.2f} СЃ вЂ” Р’С‹РїРѕР»РЅРµРЅРѕ"
+                        f"Робот проехал {direction}{ramp_text} "
+                        f"в течение {duration_ms / 1000.0:.2f} с — Выполнено"
                     )
-                return f"Р РѕР±РѕС‚ РЅР°С‡Р°Р» РґРІРёР¶РµРЅРёРµ {direction}{ramp_text} вЂ” Р’С‹РїРѕР»РЅРµРЅРѕ"
+                return f"Робот начал движение {direction}{ramp_text} — Выполнено"
             if duration_ms is not None:
                 return (
-                    f"{target_name} Р·Р°РїСѓС‰РµРЅ РІ РЅР°РїСЂР°РІР»РµРЅРёРё {direction}{ramp_text} "
-                    f"РЅР° {duration_ms / 1000.0:.2f} СЃ вЂ” Р’С‹РїРѕР»РЅРµРЅРѕ"
+                    f"{target_name} запущен в направлении {direction}{ramp_text} "
+                    f"на {duration_ms / 1000.0:.2f} с — Выполнено"
                 )
-            return f"{target_name} Р·Р°РїСѓС‰РµРЅ РІ РЅР°РїСЂР°РІР»РµРЅРёРё {direction}{ramp_text} вЂ” Р’С‹РїРѕР»РЅРµРЅРѕ"
+            return f"{target_name} запущен в направлении {direction}{ramp_text} — Выполнено"
         if target == "all":
             if duration_ms is not None:
                 return (
@@ -1659,11 +1659,11 @@ class ArduinoService:
 
     @staticmethod
     def _motor_ramp_text(*, start_pwm: int, pwm: int, ramp_duration_ms: int) -> str:
-        return f" СЃ ramp PWM {start_pwm}% -> {pwm}% Р·Р° {ramp_duration_ms / 1000.0:.2f} СЃ"
+        return f" с ramp PWM {start_pwm}% -> {pwm}% за {ramp_duration_ms / 1000.0:.2f} с"
 
     @staticmethod
     def _motor_ramp_label_suffix(*, start_pwm: int, pwm: int, ramp_duration_ms: int) -> str:
-        return f" ramp {start_pwm}%->{pwm}% {ramp_duration_ms / 1000.0:.2f}СЃ"
+        return f" ramp {start_pwm}%->{pwm}% {ramp_duration_ms / 1000.0:.2f}с"
 
     @staticmethod
     def _motor_target_name(target: MotorTarget) -> str:
@@ -1858,10 +1858,10 @@ class MotorChannel:
 
     def ramp(self, *, start_pwm: float, stop_pwm: float, ramp_seconds: float) -> "MotorRampCommandBuilder":
         if ramp_seconds < 0:
-            raise ValueError("ramp_seconds РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РѕС‚СЂРёС†Р°С‚РµР»СЊРЅС‹Рј")
+            raise ValueError("ramp_seconds не может быть отрицательным")
         ramp_duration_ms = int(round(ramp_seconds * 1000.0))
         if ramp_duration_ms < 0:
-            raise ValueError("ramp_seconds РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РѕС‚СЂРёС†Р°С‚РµР»СЊРЅС‹Рј")
+            raise ValueError("ramp_seconds не может быть отрицательным")
         return MotorRampCommandBuilder(
             self._service,
             self._target,
@@ -1934,7 +1934,7 @@ class MotorCommandBuilder:
 
 
 class MotorRampCommandBuilder:
-    """РџРѕСЃС‚СЂРѕРёС‚РµР»СЊ РѕРґРЅРѕР№ Р°С‚РѕРјР°СЂРЅРѕР№ ramp-РєРѕРјР°РЅРґС‹ РґР»СЏ РјРѕС‚РѕСЂРѕРІ."""
+    """Построитель одной атомарной ramp-команды для моторов."""
 
     def __init__(
         self,
@@ -1953,7 +1953,7 @@ class MotorRampCommandBuilder:
 
     def _send(self, *, duration_ms: int | None = None) -> dict[str, Any]:
         if self._sent:
-            raise RuntimeError("РљРѕРјР°РЅРґР° ramp-СѓРїСЂР°РІР»РµРЅРёСЏ РјРѕС‚РѕСЂРѕРј СѓР¶Рµ Р±С‹Р»Р° РѕС‚РїСЂР°РІР»РµРЅР°")
+            raise RuntimeError("Команда ramp-управления мотором уже была отправлена")
         self._sent = True
         if self._ramp_duration_ms <= 0:
             return self._service._send_motor_command(
@@ -1972,7 +1972,7 @@ class MotorRampCommandBuilder:
     def time(self, seconds: float) -> dict[str, Any]:
         duration_ms = _seconds_to_ms(seconds)
         if duration_ms < self._ramp_duration_ms:
-            raise ValueError("total_seconds РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РјРµРЅСЊС€Рµ ramp_seconds")
+            raise ValueError("total_seconds не может быть меньше ramp_seconds")
         response = self._send(duration_ms=duration_ms)
         self._service._wait_for_timed_completion(duration_ms)
         return response
@@ -1986,7 +1986,7 @@ class MotorRampCommandBuilder:
         try:
             self._send()
         except Exception:
-            self._service._logger.debug("РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РїСЂР°РІРёС‚СЊ РЅРµСЏРІРЅСѓСЋ ramp-РєРѕРјР°РЅРґСѓ РјРѕС‚РѕСЂР° РїСЂРё РѕС‡РёСЃС‚РєРµ РѕР±СЉРµРєС‚Р°", exc_info=True)
+            self._service._logger.debug("Не удалось отправить неявную ramp-команду мотора при очистке объекта", exc_info=True)
 
 
 class ServoController:

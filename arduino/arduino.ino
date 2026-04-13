@@ -884,11 +884,11 @@ void handleSetMotor(long requestId, const char* payload) {
     rampDurationMs = 0;
   }
   if (hasRampDuration && rampDurationMs > 0 && !hasStartPwm) {
-    sendErrorResponse(requestId, "bad_request", "РґР»СЏ ramp РЅСѓР¶РЅРѕ РїРѕР»Рµ start_pwm");
+    sendErrorResponse(requestId, "bad_request", "для ramp нужно поле start_pwm");
     return;
   }
   if (hasRampDuration && durationMs > 0 && rampDurationMs > durationMs) {
-    sendErrorResponse(requestId, "bad_request", "ramp_duration_ms РЅРµ РґРѕР»Р¶РµРЅ РїСЂРµРІС‹С€Р°С‚СЊ duration_ms");
+    sendErrorResponse(requestId, "bad_request", "ramp_duration_ms не должен превышать duration_ms");
     return;
   }
 
