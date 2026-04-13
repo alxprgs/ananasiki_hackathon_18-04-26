@@ -14,6 +14,7 @@ from raspberry.arduino_service import (
     ArduinoService,
     ArduinoUnavailableError,
     MotionMapCalibration,
+    SerialTimeoutError,
 )
 
 
@@ -185,6 +186,22 @@ class ArduinoServiceTests(unittest.TestCase):
                 port_enumerator=lambda: [],
             )
 
+    @patch("raspberry.arduino_service.time.sleep", return_value=None)
+    def test_requested_port_waits_for_device_warmup_before_ping(self, sleep_mock) -> None:
+        connection = FakeSerial(['{"id":1,"ok":true,"data":{"pong":true}}\n'])
+        connection.port = "COM1"  # type: ignore[attr-defined]
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.warmup"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        sleep_mock.assert_called_once_with(2.0)
+        service.close()
+
     def test_no_serial_ports_raises_unavailable_error(self) -> None:
         with self.assertRaises(ArduinoUnavailableError):
             ArduinoService(
@@ -192,6 +209,29 @@ class ArduinoServiceTests(unittest.TestCase):
                 serial_factory=lambda **kwargs: FakeSerial([]),
                 port_enumerator=lambda: [],
             )
+
+    def test_timeout_logs_request_id_and_timeout(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                "",
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.timeout"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        with self.assertLogs("test.timeout", level="WARNING") as logs:
+            with self.assertRaises(SerialTimeoutError):
+                service.button_status()
+
+        self.assertIn("Arduino не ответила на запрос id=2 в течение 1.00 с", "\n".join(logs.output))
+        service.close()
 
     @patch("raspberry.arduino_service.time.sleep", return_value=None)
     def test_align_parallel_to_wall_turns_right_for_right_wall(self, _sleep) -> None:

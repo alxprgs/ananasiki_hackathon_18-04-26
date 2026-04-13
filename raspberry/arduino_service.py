@@ -30,6 +30,7 @@ except ImportError:  # pragma: no cover - проверяется через вн
 
 
 LOGGER = logging.getLogger(__name__)
+DEFAULT_CONNECT_WARMUP_SECONDS = 2.0
 UnitName = Literal["mm", "cm", "m"]
 MotorTarget = Literal["all", "left", "right"]
 WallSide = Literal["left", "right"]
@@ -210,6 +211,7 @@ class ArduinoService:
         baudrate: int = 115200,
         timeout: float = 1.0,
         retry_count: int = 1,
+        connect_warmup_seconds: float = DEFAULT_CONNECT_WARMUP_SECONDS,
         logger: logging.Logger | None = None,
         serial_factory: Callable[..., Any] | None = None,
         port_enumerator: Callable[[], list[Any]] | None = None,
@@ -224,6 +226,9 @@ class ArduinoService:
             baudrate: Скорость serial-соединения.
             timeout: Таймаут чтения и записи serial-соединения в секундах.
             retry_count: Количество повторов для идемпотентных команд чтения.
+            connect_warmup_seconds: Пауза после открытия реального COM-порта,
+                чтобы Arduino успела перезагрузиться и начать отвечать на
+                стартовый ``ping``.
             logger: Пользовательский logger. Если не передан, используется
                 модульный logger.
             serial_factory: Точка расширения для подмены конструктора serial-
@@ -244,6 +249,7 @@ class ArduinoService:
         self._port_enumerator = port_enumerator or _default_port_enumerator
         self._timeout = timeout
         self._retry_count = retry_count
+        self._connect_warmup_seconds = max(0.0, float(connect_warmup_seconds))
         self._request_ids = count(1)
         self._lock = threading.RLock()
         self._closed = False
@@ -309,14 +315,30 @@ class ArduinoService:
             connection.reset_input_buffer()
         if hasattr(connection, "reset_output_buffer"):
             connection.reset_output_buffer()
+        if self._should_wait_for_device_warmup(connection):
+            self._logger.info(
+                "Ждём %.1f с после открытия %s, чтобы Arduino завершила перезагрузку",
+                self._connect_warmup_seconds,
+                port,
+            )
+            time.sleep(self._connect_warmup_seconds)
+            if hasattr(connection, "reset_input_buffer"):
+                connection.reset_input_buffer()
         return connection
+
+    def _should_wait_for_device_warmup(self, connection: Any) -> bool:
+        if self._connect_warmup_seconds <= 0:
+            return False
+        return any(hasattr(connection, attr) for attr in ("port", "portstr", "name"))
 
     def _validate_connection(self, connection: Any, port: str) -> None:
         original_serial = getattr(self, "_serial", None)
         self._serial = connection
         try:
+            self._logger.info("Проверяем связь с Arduino на %s через ping", port)
             payload = self._send_request("ping", idempotent=True, retries=self._retry_count)
-        except Exception:
+        except Exception as exc:
+            self._logger.error("Стартовый ping к Arduino на %s завершился ошибкой: %s", port, exc)
             if hasattr(connection, "close"):
                 connection.close()
             if original_serial is not None:
@@ -1512,6 +1534,7 @@ class ArduinoService:
             request_id = next(self._request_ids)
             payload = {"id": request_id, "op": op, "args": args or {}}
             encoded = json.dumps(payload, separators=(",", ":")) + "\n"
+            self._logger.debug("Отправляем запрос к Arduino id=%s op=%s args=%s", request_id, op, payload["args"])
             self._serial.write(encoded.encode("utf-8"))
             if hasattr(self._serial, "flush"):
                 self._serial.flush()
@@ -1543,11 +1566,18 @@ class ArduinoService:
             decoded = str(raw_line).strip()
 
         if not decoded:
+            self._logger.warning(
+                "Arduino не ответила на запрос id=%s в течение %.2f с",
+                request_id,
+                self._timeout,
+            )
             raise SerialTimeoutError(f"Истекло время ожидания ответа на запрос {request_id}")
 
+        self._logger.debug("Получена строка ответа Arduino для id=%s: %s", request_id, decoded)
         try:
             parsed = json.loads(decoded)
         except json.JSONDecodeError as exc:
+            self._logger.error("Arduino вернула некорректный JSON для id=%s: %s", request_id, decoded)
             raise ArduinoProtocolError(f"Получен повреждённый JSON: {decoded}") from exc
         return parsed
 
