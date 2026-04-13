@@ -11,7 +11,7 @@ except ImportError:  # pragma: no cover - позволяет запускать 
 def main():
     with ArduinoService(port="COM3") as robot:
         robot.start_activity_session(include_map=True)
-        robot.eng_r.pwm(50).time(1)
+        robot.eng_r.pwm(100).time(10)
 
 if __name__ == "__main__":  
     main()
