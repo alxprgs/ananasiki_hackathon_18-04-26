@@ -178,6 +178,103 @@ class ArduinoServiceTests(unittest.TestCase):
         self.assertIn("При значениях ниже 60 двигатель может работать нестабильно", "\n".join(logs.output))
         service.close()
 
+    @patch("raspberry.arduino_service.time.sleep", return_value=None)
+    def test_timed_ramp_builder_sends_single_atomic_command(self, sleep_mock) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"target":"right","pwm":100,"duration_ms":3000,"start_pwm":10,"ramp_duration_ms":500}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.motor.ramp"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        with self.assertLogs("test.motor.ramp", level="WARNING") as logs:
+            service.eng_r.ramp(start_pwm=10, stop_pwm=100, ramp_seconds=0.5).time(3)
+
+        payload = json.loads(connection.writes[1])
+        self.assertEqual(payload["op"], "set_motor")
+        self.assertEqual(payload["args"]["target"], "right")
+        self.assertEqual(payload["args"]["pwm"], 100)
+        self.assertEqual(payload["args"]["start_pwm"], 10)
+        self.assertEqual(payload["args"]["ramp_duration_ms"], 500)
+        self.assertEqual(payload["args"]["duration_ms"], 3000)
+        sleep_mock.assert_called_once_with(3.0)
+        self.assertIn("ramp", "\n".join(logs.output))
+        service.close()
+
+    def test_ramp_now_sends_command_without_duration(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"target":"left","pwm":90,"start_pwm":70,"ramp_duration_ms":250}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.motor.ramp.now"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        service.eng_l.ramp(start_pwm=70, stop_pwm=90, ramp_seconds=0.25).now()
+
+        payload = json.loads(connection.writes[1])
+        self.assertEqual(payload["args"]["target"], "left")
+        self.assertEqual(payload["args"]["start_pwm"], 70)
+        self.assertEqual(payload["args"]["pwm"], 90)
+        self.assertEqual(payload["args"]["ramp_duration_ms"], 250)
+        self.assertNotIn("duration_ms", payload["args"])
+        service.close()
+
+    def test_ramp_time_rejects_total_shorter_than_ramp(self) -> None:
+        connection = FakeSerial(['{"id":1,"ok":true,"data":{"pong":true}}\n'])
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.motor.ramp.validation"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        with self.assertRaises(ValueError):
+            service.eng_all.ramp(start_pwm=10, stop_pwm=100, ramp_seconds=0.6).time(0.5)
+
+        service.close()
+
+    def test_zero_second_ramp_falls_back_to_plain_pwm_command(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"target":"all","pwm":80,"duration_ms":1000}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.motor.ramp.zero"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        with patch("raspberry.arduino_service.time.sleep", return_value=None):
+            service.eng_all.ramp(start_pwm=10, stop_pwm=80, ramp_seconds=0).time(1)
+
+        payload = json.loads(connection.writes[1])
+        self.assertEqual(payload["args"]["pwm"], 80)
+        self.assertNotIn("start_pwm", payload["args"])
+        self.assertNotIn("ramp_duration_ms", payload["args"])
+        service.close()
+
     def test_requested_port_failure_raises_original_error(self) -> None:
         connection = FakeSerial(['{"id":1,"ok":false,"error":{"code":"bad","message":"nope"}}\n'])
 
@@ -559,6 +656,43 @@ class ArduinoServiceTests(unittest.TestCase):
         self.assertAlmostEqual(summary["final_pose"]["x_mm"], 100.0, places=3)
         self.assertAlmostEqual(summary["final_pose"]["y_mm"], 0.0, places=3)
 
+        service.close()
+
+    def test_activity_session_integrates_ramp_motion_using_actual_elapsed_time(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"target":"all","pwm":100,"duration_ms":3000,"start_pwm":0,"ramp_duration_ms":1000}}\n',
+            ]
+        )
+        clock = FakeClock(start=200.0)
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.activity.ramp"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+            monotonic_clock=clock.now,
+        )
+
+        session_dir = self._make_test_dir("activity_ramp") / "session"
+        service.start_activity_session(
+            output_dir=session_dir,
+            calibration=MotionMapCalibration(
+                max_linear_speed_mm_per_sec=100.0,
+                max_turn_deg_per_sec=180.0,
+            ),
+        )
+
+        with patch("raspberry.arduino_service.time.sleep", side_effect=lambda seconds: clock.advance(seconds)):
+            service.eng_all.ramp(start_pwm=0, stop_pwm=100, ramp_seconds=1.0).time(3.0)
+        summary = service.stop_activity_session()
+
+        self.assertAlmostEqual(summary["final_pose"]["x_mm"], 250.0, places=3)
+        events = json.loads((session_dir / "events.json").read_text(encoding="utf-8"))
+        set_motor_event = next(event for event in events if event["action"] == "set_motor")
+        self.assertEqual(set_motor_event["params"]["start_pwm"], 0)
+        self.assertEqual(set_motor_event["params"]["ramp_duration_ms"], 1000)
         service.close()
 
     def test_no_activity_artifacts_created_when_recording_is_disabled(self) -> None:

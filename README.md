@@ -228,6 +228,7 @@ with ArduinoService() as arduino:
     print(arduino.align_parallel_to_wall(wall_side="right", tolerance_mm=8.0))
 
     arduino.eng_all.pwm(40).time(1.5)
+    arduino.eng_r.ramp(start_pwm=10, stop_pwm=100, ramp_seconds=0.5).time(3)
     arduino.eng_l.pwm(25).now()
     arduino.stop_all()
 
@@ -243,6 +244,7 @@ with ArduinoService() as arduino:
 - `button_status()`
 - `align_parallel_to_wall(front_sensor_id=1, rear_sensor_id=2, wall_side="right", ...)`
 - `eng_all.pwm(percent).time(seconds)`
+- `eng_r.ramp(start_pwm=10, stop_pwm=100, ramp_seconds=0.5).time(3)`
 - `eng_l.pwm(percent).now()`
 - `eng_r.pwm(percent).now()`
 - `servo.set(angle_deg)`
@@ -475,8 +477,23 @@ else:
 
 ```python
 arduino.eng_all.pwm(40).time(1.5)
+arduino.eng_r.ramp(start_pwm=10, stop_pwm=100, ramp_seconds=0.5).time(3)
 arduino.eng_l.pwm(25).now()
 arduino.eng_r.pwm(-30).time(0.3)
+```
+
+##### `ramp(start_pwm, stop_pwm, ramp_seconds)`
+
+- РїР»Р°РІРЅРѕ РјРµРЅСЏРµС‚ PWM РѕС‚ `start_pwm` РґРѕ `stop_pwm` Р·Р° `ramp_seconds`;
+- РїРѕСЃР»Рµ ramp РјРѕС‚РѕСЂ РїСЂРѕРґРѕР»Р¶Р°РµС‚ СЂР°Р±РѕС‚Р°С‚СЊ СЃ `stop_pwm` РґРѕ РєРѕРЅС†Р° `.time(seconds)` РёР»Рё РґРѕ РЅРѕРІРѕР№ РєРѕРјР°РЅРґС‹/`stop_all()` РІ СЂРµР¶РёРјРµ `.now()`;
+- `ramp_seconds=0` РѕР·РЅР°С‡Р°РµС‚ РјРіРЅРѕРІРµРЅРЅС‹Р№ РїРµСЂРµС…РѕРґ Рє `stop_pwm`;
+- РґР»СЏ `.time(total_seconds)` Р·РЅР°С‡РµРЅРёРµ `total_seconds` РЅРµ РґРѕР»Р¶РЅРѕ Р±С‹С‚СЊ РјРµРЅСЊС€Рµ `ramp_seconds`, РёРЅР°С‡Рµ Р±СѓРґРµС‚ `ValueError`;
+- РїСЂРё РїСЂРѕС„РёР»Рµ, РєРѕС‚РѕСЂС‹Р№ Р·Р°С…РѕРґРёС‚ РІ Р·РѕРЅСѓ `abs(pwm) < 60`, СЃРµСЂРІРёСЃ РїРёС€РµС‚ warning РІ Р»РѕРі;
+- Р¶СѓСЂРЅР°Р» СЃРµСЃСЃРёРё Рё `route.svg` РїРѕРєР°Р·С‹РІР°СЋС‚ С‚РѕР»СЊРєРѕ СЂРµР°Р»СЊРЅРѕ РїСЂРѕС€РµРґС€РµРµ РІСЂРµРјСЏ РґРІРёР¶РµРЅРёСЏ, Р±РµР· РґРѕСЂРёСЃРѕРІРєРё РѕСЃС‚Р°РІС€РµР№СЃСЏ С‡Р°СЃС‚Рё РєРѕРјР°РЅРґС‹.
+
+```python
+arduino.eng_r.ramp(start_pwm=10, stop_pwm=100, ramp_seconds=0.5).time(3)
+arduino.eng_all.ramp(start_pwm=0, stop_pwm=80, ramp_seconds=1.0).now()
 ```
 
 ##### `.time(seconds)`

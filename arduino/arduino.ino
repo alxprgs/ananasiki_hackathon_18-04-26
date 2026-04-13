@@ -134,6 +134,11 @@ struct MotorRuntimeState {
   int currentPercent;
   bool timed;
   unsigned long stopAtMs;
+  bool rampActive;
+  int rampStartPercent;
+  int rampStopPercent;
+  unsigned long rampStartedAtMs;
+  unsigned long rampDurationMs;
 };
 
 /*
@@ -169,8 +174,8 @@ DistanceSensorState gSensors[2] = {
 int gActiveSensorIndex = -1;
 int gNextSensorIndex = 0;
 
-MotorRuntimeState gLeftMotor = {0, false, 0};
-MotorRuntimeState gRightMotor = {0, false, 0};
+MotorRuntimeState gLeftMotor = {0, false, 0, false, 0, 0, 0, 0};
+MotorRuntimeState gRightMotor = {0, false, 0, false, 0, 0, 0, 0};
 
 StepperRuntimeState gStepper = {false, false, false, false, 0, 0, 0, 0};
 
@@ -383,17 +388,28 @@ void stopAllMotion() {
   gLeftMotor.currentPercent = 0;
   gLeftMotor.timed = false;
   gLeftMotor.stopAtMs = 0;
+  gLeftMotor.rampActive = false;
+  gLeftMotor.rampStartPercent = 0;
+  gLeftMotor.rampStopPercent = 0;
+  gLeftMotor.rampStartedAtMs = 0;
+  gLeftMotor.rampDurationMs = 0;
   gRightMotor.currentPercent = 0;
   gRightMotor.timed = false;
   gRightMotor.stopAtMs = 0;
+  gRightMotor.rampActive = false;
+  gRightMotor.rampStartPercent = 0;
+  gRightMotor.rampStopPercent = 0;
+  gRightMotor.rampStartedAtMs = 0;
+  gRightMotor.rampDurationMs = 0;
   applyMotorOutput(leftMotorPins(), 0);
   applyMotorOutput(rightMotorPins(), 0);
   stopStepper();
 }
 
 // Запоминаем новое состояние моторного канала и сразу применяем его к железу.
-void setMotorState(MotorRuntimeState& state, const MotorPins& pins, int percent, long durationMs) {
-  state.currentPercent = clampPercent(percent);
+void setMotorState(MotorRuntimeState& state, const MotorPins& pins, int percent, long durationMs, bool rampEnabled = false, int startPercent = 0, long rampDurationMs = 0) {
+  int boundedPercent = clampPercent(percent);
+  int boundedStartPercent = clampPercent(startPercent);
   if (durationMs > 0) {
     state.timed = true;
     state.stopAtMs = millis() + static_cast<unsigned long>(durationMs);
@@ -401,22 +417,37 @@ void setMotorState(MotorRuntimeState& state, const MotorPins& pins, int percent,
     state.timed = false;
     state.stopAtMs = 0;
   }
+  if (rampEnabled && rampDurationMs > 0) {
+    state.rampActive = true;
+    state.rampStartPercent = boundedStartPercent;
+    state.rampStopPercent = boundedPercent;
+    state.rampStartedAtMs = millis();
+    state.rampDurationMs = static_cast<unsigned long>(rampDurationMs);
+    state.currentPercent = boundedStartPercent;
+  } else {
+    state.rampActive = false;
+    state.rampStartPercent = 0;
+    state.rampStopPercent = 0;
+    state.rampStartedAtMs = 0;
+    state.rampDurationMs = 0;
+    state.currentPercent = boundedPercent;
+  }
   applyMotorOutput(pins, state.currentPercent);
 }
 
 // Разводим high-level команду по одному или двум каналам.
-void setMotorCommand(const char* target, int percent, long durationMs) {
+void setMotorCommand(const char* target, int percent, long durationMs, bool rampEnabled = false, int startPercent = 0, long rampDurationMs = 0) {
   if (strcmp(target, "all") == 0) {
-    setMotorState(gLeftMotor, leftMotorPins(), percent, durationMs);
-    setMotorState(gRightMotor, rightMotorPins(), percent, durationMs);
+    setMotorState(gLeftMotor, leftMotorPins(), percent, durationMs, rampEnabled, startPercent, rampDurationMs);
+    setMotorState(gRightMotor, rightMotorPins(), percent, durationMs, rampEnabled, startPercent, rampDurationMs);
     return;
   }
   if (strcmp(target, "left") == 0) {
-    setMotorState(gLeftMotor, leftMotorPins(), percent, durationMs);
+    setMotorState(gLeftMotor, leftMotorPins(), percent, durationMs, rampEnabled, startPercent, rampDurationMs);
     return;
   }
   if (strcmp(target, "right") == 0) {
-    setMotorState(gRightMotor, rightMotorPins(), percent, durationMs);
+    setMotorState(gRightMotor, rightMotorPins(), percent, durationMs, rampEnabled, startPercent, rampDurationMs);
     return;
   }
 }
@@ -429,15 +460,51 @@ void setMotorCommand(const char* target, int percent, long durationMs) {
 void updateMotorTimers() {
   unsigned long nowMs = millis();
 
+  if (gLeftMotor.rampActive) {
+    if (gLeftMotor.rampDurationMs == 0 || hasElapsed(nowMs, gLeftMotor.rampStartedAtMs + gLeftMotor.rampDurationMs)) {
+      gLeftMotor.rampActive = false;
+      gLeftMotor.currentPercent = gLeftMotor.rampStopPercent;
+      applyMotorOutput(leftMotorPins(), gLeftMotor.currentPercent);
+    } else {
+      long elapsedMs = static_cast<long>(nowMs - gLeftMotor.rampStartedAtMs);
+      long deltaPercent = static_cast<long>(gLeftMotor.rampStopPercent - gLeftMotor.rampStartPercent);
+      int interpolatedPercent =
+          clampPercent(gLeftMotor.rampStartPercent + ((deltaPercent * elapsedMs) / static_cast<long>(gLeftMotor.rampDurationMs)));
+      if (interpolatedPercent != gLeftMotor.currentPercent) {
+        gLeftMotor.currentPercent = interpolatedPercent;
+        applyMotorOutput(leftMotorPins(), gLeftMotor.currentPercent);
+      }
+    }
+  }
+
+  if (gRightMotor.rampActive) {
+    if (gRightMotor.rampDurationMs == 0 || hasElapsed(nowMs, gRightMotor.rampStartedAtMs + gRightMotor.rampDurationMs)) {
+      gRightMotor.rampActive = false;
+      gRightMotor.currentPercent = gRightMotor.rampStopPercent;
+      applyMotorOutput(rightMotorPins(), gRightMotor.currentPercent);
+    } else {
+      long elapsedMs = static_cast<long>(nowMs - gRightMotor.rampStartedAtMs);
+      long deltaPercent = static_cast<long>(gRightMotor.rampStopPercent - gRightMotor.rampStartPercent);
+      int interpolatedPercent =
+          clampPercent(gRightMotor.rampStartPercent + ((deltaPercent * elapsedMs) / static_cast<long>(gRightMotor.rampDurationMs)));
+      if (interpolatedPercent != gRightMotor.currentPercent) {
+        gRightMotor.currentPercent = interpolatedPercent;
+        applyMotorOutput(rightMotorPins(), gRightMotor.currentPercent);
+      }
+    }
+  }
+
   if (gLeftMotor.timed && hasElapsed(nowMs, gLeftMotor.stopAtMs)) {
     gLeftMotor.timed = false;
     gLeftMotor.currentPercent = 0;
+    gLeftMotor.rampActive = false;
     applyMotorOutput(leftMotorPins(), 0);
   }
 
   if (gRightMotor.timed && hasElapsed(nowMs, gRightMotor.stopAtMs)) {
     gRightMotor.timed = false;
     gRightMotor.currentPercent = 0;
+    gRightMotor.rampActive = false;
     applyMotorOutput(rightMotorPins(), 0);
   }
 
@@ -446,12 +513,14 @@ void updateMotorTimers() {
 
     if (!gLeftMotor.timed && gLeftMotor.currentPercent != 0) {
       gLeftMotor.currentPercent = 0;
+      gLeftMotor.rampActive = false;
       applyMotorOutput(leftMotorPins(), 0);
       stoppedUnsafeMotion = true;
     }
 
     if (!gRightMotor.timed && gRightMotor.currentPercent != 0) {
       gRightMotor.currentPercent = 0;
+      gRightMotor.rampActive = false;
       applyMotorOutput(rightMotorPins(), 0);
       stoppedUnsafeMotion = true;
     }
@@ -779,6 +848,10 @@ void handleSetMotor(long requestId, const char* payload) {
   char target[8];
   long pwm = 0;
   long durationMs = 0;
+  long startPwm = 0;
+  long rampDurationMs = 0;
+  bool hasStartPwm = false;
+  bool hasRampDuration = false;
 
   if (!extractStringField(payload, "target", target, sizeof(target))) {
     sendErrorResponse(requestId, "bad_request", "поле target обязательно");
@@ -802,7 +875,25 @@ void handleSetMotor(long requestId, const char* payload) {
     durationMs = 0;
   }
 
-  setMotorCommand(target, clampPercent(pwm), durationMs);
+  hasStartPwm = extractLongField(payload, "start_pwm", startPwm);
+  hasRampDuration = extractLongField(payload, "ramp_duration_ms", rampDurationMs);
+  if (!hasRampDuration) {
+    rampDurationMs = 0;
+  }
+  if (rampDurationMs < 0) {
+    rampDurationMs = 0;
+  }
+  if (hasRampDuration && rampDurationMs > 0 && !hasStartPwm) {
+    sendErrorResponse(requestId, "bad_request", "РґР»СЏ ramp РЅСѓР¶РЅРѕ РїРѕР»Рµ start_pwm");
+    return;
+  }
+  if (hasRampDuration && durationMs > 0 && rampDurationMs > durationMs) {
+    sendErrorResponse(requestId, "bad_request", "ramp_duration_ms РЅРµ РґРѕР»Р¶РµРЅ РїСЂРµРІС‹С€Р°С‚СЊ duration_ms");
+    return;
+  }
+
+  bool rampEnabled = hasStartPwm && hasRampDuration && rampDurationMs > 0;
+  setMotorCommand(target, clampPercent(pwm), durationMs, rampEnabled, clampPercent(startPwm), rampDurationMs);
 
   Serial.print(F("{\"id\":"));
   Serial.print(requestId);
@@ -812,6 +903,12 @@ void handleSetMotor(long requestId, const char* payload) {
   Serial.print(clampPercent(pwm));
   Serial.print(F(",\"duration_ms\":"));
   Serial.print(durationMs);
+  if (rampEnabled) {
+    Serial.print(F(",\"start_pwm\":"));
+    Serial.print(clampPercent(startPwm));
+    Serial.print(F(",\"ramp_duration_ms\":"));
+    Serial.print(rampDurationMs);
+  }
   Serial.println(F("}}"));
 }
 

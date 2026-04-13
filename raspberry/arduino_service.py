@@ -175,6 +175,14 @@ class _MotionState:
     right_pwm: int = 0
     left_auto_stop_at: float | None = None
     right_auto_stop_at: float | None = None
+    left_ramp_start_pwm: int = 0
+    right_ramp_start_pwm: int = 0
+    left_ramp_stop_pwm: int = 0
+    right_ramp_stop_pwm: int = 0
+    left_ramp_started_at: float | None = None
+    right_ramp_started_at: float | None = None
+    left_ramp_ends_at: float | None = None
+    right_ramp_ends_at: float | None = None
 
 
 @dataclass(slots=True)
@@ -955,8 +963,10 @@ class ArduinoService:
         target: MotorTarget,
         pwm: int,
         duration_ms: int | None = None,
+        start_pwm: int | None = None,
+        ramp_duration_ms: int | None = None,
     ) -> dict[str, Any]:
-        if 0 < abs(pwm) < LOW_MOTOR_PWM_WARNING_THRESHOLD:
+        if start_pwm is None and 0 < abs(pwm) < LOW_MOTOR_PWM_WARNING_THRESHOLD:
             self._logger.warning(
                 "Для команды мотора %s задан PWM %s. При значениях ниже %s двигатель может работать нестабильно "
                 "или вообще не запуститься из-за нагрузки, питания или драйвера.",
@@ -964,18 +974,56 @@ class ArduinoService:
                 pwm,
                 LOW_MOTOR_PWM_WARNING_THRESHOLD,
             )
+        if ramp_duration_ms is not None and ramp_duration_ms <= 0:
+            start_pwm = None
+            ramp_duration_ms = None
+        if start_pwm is not None and ramp_duration_ms is not None:
+            self._warn_about_motor_pwm_profile(
+                target=target,
+                start_pwm=start_pwm,
+                stop_pwm=pwm,
+                ramp_duration_ms=ramp_duration_ms,
+            )
         params: dict[str, Any] = {"target": target, "pwm": pwm}
         if duration_ms is not None:
             params["duration_ms"] = duration_ms
+        if start_pwm is not None and ramp_duration_ms is not None:
+            params["start_pwm"] = start_pwm
+            params["ramp_duration_ms"] = ramp_duration_ms
         return self._run_logged_action(
             category="movement",
             action="set_motor",
             params=params,
             protocol_op="set_motor",
-            operation=lambda: self._set_motor_request_with_activity(target=target, pwm=pwm, duration_ms=duration_ms),
-            success_text=lambda _: self._motor_success_text(target=target, pwm=pwm, duration_ms=duration_ms),
-            error_text=lambda exc: self._motor_error_text(target=target, pwm=pwm, duration_ms=duration_ms, exc=exc),
-            route_label=self._motor_route_label(target=target, pwm=pwm, duration_ms=duration_ms),
+            operation=lambda: self._set_motor_request_with_activity(
+                target=target,
+                pwm=pwm,
+                duration_ms=duration_ms,
+                start_pwm=start_pwm,
+                ramp_duration_ms=ramp_duration_ms,
+            ),
+            success_text=lambda _: self._motor_success_text(
+                target=target,
+                pwm=pwm,
+                duration_ms=duration_ms,
+                start_pwm=start_pwm,
+                ramp_duration_ms=ramp_duration_ms,
+            ),
+            error_text=lambda exc: self._motor_error_text(
+                target=target,
+                pwm=pwm,
+                duration_ms=duration_ms,
+                start_pwm=start_pwm,
+                ramp_duration_ms=ramp_duration_ms,
+                exc=exc,
+            ),
+            route_label=self._motor_route_label(
+                target=target,
+                pwm=pwm,
+                duration_ms=duration_ms,
+                start_pwm=start_pwm,
+                ramp_duration_ms=ramp_duration_ms,
+            ),
         )
 
     def _set_motor_request_with_activity(
@@ -984,12 +1032,23 @@ class ArduinoService:
         target: MotorTarget,
         pwm: int,
         duration_ms: int | None,
+        start_pwm: int | None = None,
+        ramp_duration_ms: int | None = None,
     ) -> dict[str, Any]:
         args: dict[str, Any] = {"target": target, "pwm": pwm}
         if duration_ms is not None:
             args["duration_ms"] = duration_ms
+        if start_pwm is not None and ramp_duration_ms is not None:
+            args["start_pwm"] = start_pwm
+            args["ramp_duration_ms"] = ramp_duration_ms
         response = self._send_request("set_motor", args)
-        self._apply_motor_command_to_activity(target=target, pwm=pwm, duration_ms=duration_ms)
+        self._apply_motor_command_to_activity(
+            target=target,
+            pwm=pwm,
+            duration_ms=duration_ms,
+            start_pwm=start_pwm,
+            ramp_duration_ms=ramp_duration_ms,
+        )
         return response
 
     def _stop_all_with_activity(self) -> dict[str, Any]:
@@ -1198,6 +1257,8 @@ class ArduinoService:
         state.right_pwm = 0
         state.left_auto_stop_at = None
         state.right_auto_stop_at = None
+        self._clear_motor_ramp_state(state, "left")
+        self._clear_motor_ramp_state(state, "right")
         self._append_route_point(label="Финиш")
 
     def _wait_for_timed_completion(self, duration_ms: int) -> None:
@@ -1211,6 +1272,8 @@ class ArduinoService:
         target: MotorTarget,
         pwm: int,
         duration_ms: int | None,
+        start_pwm: int | None = None,
+        ramp_duration_ms: int | None = None,
     ) -> None:
         session = self._activity_session
         if session is None:
@@ -1221,11 +1284,25 @@ class ArduinoService:
         deadline = now + (duration_ms / 1000.0) if duration_ms is not None else None
         state = session.motion_state
         if target in {"all", "left"}:
-            state.left_pwm = pwm
-            state.left_auto_stop_at = deadline
+            self._set_motor_channel_activity(
+                state,
+                "left",
+                stop_pwm=pwm,
+                deadline=deadline,
+                started_at=now,
+                start_pwm=start_pwm,
+                ramp_duration_ms=ramp_duration_ms,
+            )
         if target in {"all", "right"}:
-            state.right_pwm = pwm
-            state.right_auto_stop_at = deadline
+            self._set_motor_channel_activity(
+                state,
+                "right",
+                stop_pwm=pwm,
+                deadline=deadline,
+                started_at=now,
+                start_pwm=start_pwm,
+                ramp_duration_ms=ramp_duration_ms,
+            )
         self._append_route_point()
 
     def _apply_stop_all_to_activity(self) -> None:
@@ -1238,6 +1315,8 @@ class ArduinoService:
         state.right_pwm = 0
         state.left_auto_stop_at = None
         state.right_auto_stop_at = None
+        self._clear_motor_ramp_state(state, "left")
+        self._clear_motor_ramp_state(state, "right")
         self._append_route_point(label="Стоп")
 
     def _advance_motion_to(self, target_monotonic: float) -> None:
@@ -1252,36 +1331,46 @@ class ArduinoService:
 
         while target_monotonic > state.last_monotonic + epsilon:
             segment_end = target_monotonic
-            for deadline in (state.left_auto_stop_at, state.right_auto_stop_at):
+            for deadline in (
+                state.left_auto_stop_at,
+                state.right_auto_stop_at,
+                state.left_ramp_ends_at,
+                state.right_ramp_ends_at,
+            ):
                 if deadline is not None and state.last_monotonic + epsilon < deadline < segment_end:
                     segment_end = deadline
 
             delta_seconds = segment_end - state.last_monotonic
             if delta_seconds > epsilon:
-                self._integrate_motion_segment(state, session.calibration, delta_seconds)
+                self._integrate_motion_segment(state, session.calibration, state.last_monotonic, segment_end)
                 state.last_monotonic = segment_end
                 self._append_route_point()
             else:
                 state.last_monotonic = segment_end
 
+            self._complete_elapsed_motor_ramps(state, epsilon=epsilon)
             if state.left_auto_stop_at is not None and state.last_monotonic >= state.left_auto_stop_at - epsilon:
                 state.left_pwm = 0
                 state.left_auto_stop_at = None
+                self._clear_motor_ramp_state(state, "left")
             if state.right_auto_stop_at is not None and state.last_monotonic >= state.right_auto_stop_at - epsilon:
                 state.right_pwm = 0
                 state.right_auto_stop_at = None
+                self._clear_motor_ramp_state(state, "right")
 
     def _integrate_motion_segment(
         self,
         state: _MotionState,
         calibration: MotionMapCalibration,
-        delta_seconds: float,
+        started_at: float,
+        ended_at: float,
     ) -> None:
+        delta_seconds = ended_at - started_at
         if delta_seconds <= 0:
             return
 
-        left_ratio = state.left_pwm / 100.0
-        right_ratio = state.right_pwm / 100.0
+        left_ratio = self._average_motor_pwm_for_interval(state, "left", started_at, ended_at) / 100.0
+        right_ratio = self._average_motor_pwm_for_interval(state, "right", started_at, ended_at) / 100.0
         linear_speed = ((left_ratio + right_ratio) / 2.0) * calibration.max_linear_speed_mm_per_sec
         angular_speed_deg = ((right_ratio - left_ratio) / 2.0) * calibration.max_turn_deg_per_sec
         heading_delta_deg = angular_speed_deg * delta_seconds
@@ -1291,6 +1380,104 @@ class ArduinoService:
         state.x_mm += distance_mm * math.cos(heading_mid_rad)
         state.y_mm += distance_mm * math.sin(heading_mid_rad)
         state.heading_deg = self._normalize_heading(state.heading_deg + heading_delta_deg)
+
+    def _warn_about_motor_pwm_profile(
+        self,
+        *,
+        target: MotorTarget,
+        start_pwm: int,
+        stop_pwm: int,
+        ramp_duration_ms: int,
+    ) -> None:
+        if not self._motor_profile_enters_low_pwm_zone(start_pwm, stop_pwm):
+            return
+        self._logger.warning(
+            "Р”Р»СЏ ramp-РєРѕРјР°РЅРґС‹ РјРѕС‚РѕСЂР° %s Р·Р°РґР°РЅ РїСЂРѕС„РёР»СЊ PWM %s -> %s Р·Р° %.3f СЃ. "
+            "Р’ РґРёР°РїР°Р·РѕРЅРµ РЅРёР¶Рµ %s РґРІРёРіР°С‚РµР»СЊ РјРѕР¶РµС‚ СЂР°Р±РѕС‚Р°С‚СЊ РЅРµСЃС‚Р°Р±РёР»СЊРЅРѕ "
+            "РёР»Рё РІРѕРѕР±С‰Рµ РЅРµ Р·Р°РїСѓСЃС‚РёС‚СЊСЃСЏ РёР·-Р·Р° РЅР°РіСЂСѓР·РєРё, РїРёС‚Р°РЅРёСЏ РёР»Рё РґСЂР°Р№РІРµСЂР°.",
+            target,
+            start_pwm,
+            stop_pwm,
+            ramp_duration_ms / 1000.0,
+            LOW_MOTOR_PWM_WARNING_THRESHOLD,
+        )
+
+    @staticmethod
+    def _motor_profile_enters_low_pwm_zone(start_pwm: int, stop_pwm: int) -> bool:
+        if start_pwm == stop_pwm:
+            return 0 < abs(start_pwm) < LOW_MOTOR_PWM_WARNING_THRESHOLD
+        if start_pwm == 0 or stop_pwm == 0:
+            return start_pwm != stop_pwm
+        if start_pwm * stop_pwm < 0:
+            return True
+        return min(abs(start_pwm), abs(stop_pwm)) < LOW_MOTOR_PWM_WARNING_THRESHOLD
+
+    def _set_motor_channel_activity(
+        self,
+        state: _MotionState,
+        channel: Literal["left", "right"],
+        *,
+        stop_pwm: int,
+        deadline: float | None,
+        started_at: float,
+        start_pwm: int | None,
+        ramp_duration_ms: int | None,
+    ) -> None:
+        setattr(state, f"{channel}_auto_stop_at", deadline)
+        if start_pwm is not None and ramp_duration_ms is not None:
+            setattr(state, f"{channel}_pwm", start_pwm)
+            setattr(state, f"{channel}_ramp_start_pwm", start_pwm)
+            setattr(state, f"{channel}_ramp_stop_pwm", stop_pwm)
+            setattr(state, f"{channel}_ramp_started_at", started_at)
+            setattr(state, f"{channel}_ramp_ends_at", started_at + (ramp_duration_ms / 1000.0))
+            return
+        setattr(state, f"{channel}_pwm", stop_pwm)
+        self._clear_motor_ramp_state(state, channel)
+
+    @staticmethod
+    def _clear_motor_ramp_state(state: _MotionState, channel: Literal["left", "right"]) -> None:
+        setattr(state, f"{channel}_ramp_start_pwm", 0)
+        setattr(state, f"{channel}_ramp_stop_pwm", 0)
+        setattr(state, f"{channel}_ramp_started_at", None)
+        setattr(state, f"{channel}_ramp_ends_at", None)
+
+    def _complete_elapsed_motor_ramps(self, state: _MotionState, *, epsilon: float) -> None:
+        for channel in ("left", "right"):
+            ramp_end = getattr(state, f"{channel}_ramp_ends_at")
+            if ramp_end is None or state.last_monotonic < ramp_end - epsilon:
+                continue
+            setattr(state, f"{channel}_pwm", getattr(state, f"{channel}_ramp_stop_pwm"))
+            self._clear_motor_ramp_state(state, channel)
+
+    def _average_motor_pwm_for_interval(
+        self,
+        state: _MotionState,
+        channel: Literal["left", "right"],
+        started_at: float,
+        ended_at: float,
+    ) -> float:
+        current_pwm = float(getattr(state, f"{channel}_pwm"))
+        ramp_started_at = getattr(state, f"{channel}_ramp_started_at")
+        ramp_ends_at = getattr(state, f"{channel}_ramp_ends_at")
+        if ramp_started_at is None or ramp_ends_at is None:
+            return current_pwm
+
+        ramp_duration = ramp_ends_at - ramp_started_at
+        if ramp_duration <= 0:
+            return float(getattr(state, f"{channel}_ramp_stop_pwm"))
+
+        interval_start = max(started_at, ramp_started_at)
+        interval_end = min(ended_at, ramp_ends_at)
+        if interval_end <= interval_start:
+            return current_pwm
+
+        start_pwm = float(getattr(state, f"{channel}_ramp_start_pwm"))
+        stop_pwm = float(getattr(state, f"{channel}_ramp_stop_pwm"))
+        start_progress = (interval_start - ramp_started_at) / ramp_duration
+        end_progress = (interval_end - ramp_started_at) / ramp_duration
+        pwm_at_start = start_pwm + ((stop_pwm - start_pwm) * start_progress)
+        pwm_at_end = start_pwm + ((stop_pwm - start_pwm) * end_progress)
+        return (pwm_at_start + pwm_at_end) / 2.0
 
     def _append_route_point(self, label: str | None = None) -> None:
         session = self._activity_session
@@ -1395,9 +1582,36 @@ class ArduinoService:
             + "</svg>"
         )
 
-    def _motor_success_text(self, *, target: MotorTarget, pwm: int, duration_ms: int | None) -> str:
+    def _motor_success_text(
+        self,
+        *,
+        target: MotorTarget,
+        pwm: int,
+        duration_ms: int | None,
+        start_pwm: int | None = None,
+        ramp_duration_ms: int | None = None,
+    ) -> str:
         target_name = self._motor_target_name(target)
         direction = self._motor_direction_name(pwm)
+        ramp_text = (
+            self._motor_ramp_text(start_pwm=start_pwm, pwm=pwm, ramp_duration_ms=ramp_duration_ms)
+            if start_pwm is not None and ramp_duration_ms is not None
+            else ""
+        )
+        if start_pwm is not None and ramp_duration_ms is not None:
+            if target == "all":
+                if duration_ms is not None:
+                    return (
+                        f"Р РѕР±РѕС‚ РїСЂРѕРµС…Р°Р» {direction}{ramp_text} "
+                        f"РІ С‚РµС‡РµРЅРёРµ {duration_ms / 1000.0:.2f} СЃ вЂ” Р’С‹РїРѕР»РЅРµРЅРѕ"
+                    )
+                return f"Р РѕР±РѕС‚ РЅР°С‡Р°Р» РґРІРёР¶РµРЅРёРµ {direction}{ramp_text} вЂ” Р’С‹РїРѕР»РЅРµРЅРѕ"
+            if duration_ms is not None:
+                return (
+                    f"{target_name} Р·Р°РїСѓС‰РµРЅ РІ РЅР°РїСЂР°РІР»РµРЅРёРё {direction}{ramp_text} "
+                    f"РЅР° {duration_ms / 1000.0:.2f} СЃ вЂ” Р’С‹РїРѕР»РЅРµРЅРѕ"
+                )
+            return f"{target_name} Р·Р°РїСѓС‰РµРЅ РІ РЅР°РїСЂР°РІР»РµРЅРёРё {direction}{ramp_text} вЂ” Р’С‹РїРѕР»РЅРµРЅРѕ"
         if target == "all":
             if duration_ms is not None:
                 return (
@@ -1418,6 +1632,8 @@ class ArduinoService:
         target: MotorTarget,
         pwm: int,
         duration_ms: int | None,
+        start_pwm: int | None = None,
+        ramp_duration_ms: int | None = None,
         exc: Exception,
     ) -> str:
         target_name = "роботом" if target == "all" else self._motor_target_name(target).lower()
@@ -1427,11 +1643,27 @@ class ArduinoService:
             f"в направлении {self._motor_direction_name(pwm)} с мощностью {abs(pwm)}%{duration_text}: {exc}"
         )
 
-    def _motor_route_label(self, *, target: MotorTarget, pwm: int, duration_ms: int | None) -> str:
+    def _motor_route_label(
+        self,
+        *,
+        target: MotorTarget,
+        pwm: int,
+        duration_ms: int | None,
+        start_pwm: int | None = None,
+        ramp_duration_ms: int | None = None,
+    ) -> str:
         base = "Робот" if target == "all" else self._motor_target_name(target)
         if duration_ms is not None:
             return f"{base}: {self._motor_direction_name(pwm)} {abs(pwm)}% {duration_ms / 1000.0:.2f}с"
         return f"{base}: {self._motor_direction_name(pwm)} {abs(pwm)}%"
+
+    @staticmethod
+    def _motor_ramp_text(*, start_pwm: int, pwm: int, ramp_duration_ms: int) -> str:
+        return f" СЃ ramp PWM {start_pwm}% -> {pwm}% Р·Р° {ramp_duration_ms / 1000.0:.2f} СЃ"
+
+    @staticmethod
+    def _motor_ramp_label_suffix(*, start_pwm: int, pwm: int, ramp_duration_ms: int) -> str:
+        return f" ramp {start_pwm}%->{pwm}% {ramp_duration_ms / 1000.0:.2f}СЃ"
 
     @staticmethod
     def _motor_target_name(target: MotorTarget) -> str:
@@ -1624,6 +1856,20 @@ class MotorChannel:
         """
         return MotorCommandBuilder(self._service, self._target, _clamp_pwm(percent))
 
+    def ramp(self, *, start_pwm: float, stop_pwm: float, ramp_seconds: float) -> "MotorRampCommandBuilder":
+        if ramp_seconds < 0:
+            raise ValueError("ramp_seconds РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РѕС‚СЂРёС†Р°С‚РµР»СЊРЅС‹Рј")
+        ramp_duration_ms = int(round(ramp_seconds * 1000.0))
+        if ramp_duration_ms < 0:
+            raise ValueError("ramp_seconds РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РѕС‚СЂРёС†Р°С‚РµР»СЊРЅС‹Рј")
+        return MotorRampCommandBuilder(
+            self._service,
+            self._target,
+            _clamp_pwm(start_pwm),
+            _clamp_pwm(stop_pwm),
+            ramp_duration_ms,
+        )
+
 
 class MotorCommandBuilder:
     """Построитель одной атомарной команды управления моторами.
@@ -1685,6 +1931,62 @@ class MotorCommandBuilder:
             self._send()
         except Exception:
             self._service._logger.debug("Не удалось отправить неявную команду мотора при очистке объекта", exc_info=True)
+
+
+class MotorRampCommandBuilder:
+    """РџРѕСЃС‚СЂРѕРёС‚РµР»СЊ РѕРґРЅРѕР№ Р°С‚РѕРјР°СЂРЅРѕР№ ramp-РєРѕРјР°РЅРґС‹ РґР»СЏ РјРѕС‚РѕСЂРѕРІ."""
+
+    def __init__(
+        self,
+        service: ArduinoService,
+        target: MotorTarget,
+        start_pwm: int,
+        stop_pwm: int,
+        ramp_duration_ms: int,
+    ) -> None:
+        self._service = service
+        self._target = target
+        self._start_pwm = start_pwm
+        self._stop_pwm = stop_pwm
+        self._ramp_duration_ms = max(0, ramp_duration_ms)
+        self._sent = False
+
+    def _send(self, *, duration_ms: int | None = None) -> dict[str, Any]:
+        if self._sent:
+            raise RuntimeError("РљРѕРјР°РЅРґР° ramp-СѓРїСЂР°РІР»РµРЅРёСЏ РјРѕС‚РѕСЂРѕРј СѓР¶Рµ Р±С‹Р»Р° РѕС‚РїСЂР°РІР»РµРЅР°")
+        self._sent = True
+        if self._ramp_duration_ms <= 0:
+            return self._service._send_motor_command(
+                target=self._target,
+                pwm=self._stop_pwm,
+                duration_ms=duration_ms,
+            )
+        return self._service._send_motor_command(
+            target=self._target,
+            pwm=self._stop_pwm,
+            duration_ms=duration_ms,
+            start_pwm=self._start_pwm,
+            ramp_duration_ms=self._ramp_duration_ms,
+        )
+
+    def time(self, seconds: float) -> dict[str, Any]:
+        duration_ms = _seconds_to_ms(seconds)
+        if duration_ms < self._ramp_duration_ms:
+            raise ValueError("total_seconds РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РјРµРЅСЊС€Рµ ramp_seconds")
+        response = self._send(duration_ms=duration_ms)
+        self._service._wait_for_timed_completion(duration_ms)
+        return response
+
+    def now(self) -> dict[str, Any]:
+        return self._send()
+
+    def __del__(self) -> None:  # pragma: no cover
+        if self._sent or self._service.is_closed:
+            return
+        try:
+            self._send()
+        except Exception:
+            self._service._logger.debug("РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РїСЂР°РІРёС‚СЊ РЅРµСЏРІРЅСѓСЋ ramp-РєРѕРјР°РЅРґСѓ РјРѕС‚РѕСЂР° РїСЂРё РѕС‡РёСЃС‚РєРµ РѕР±СЉРµРєС‚Р°", exc_info=True)
 
 
 class ServoController:
