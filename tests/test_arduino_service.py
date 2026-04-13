@@ -165,7 +165,8 @@ class ArduinoServiceTests(unittest.TestCase):
             port_enumerator=lambda: [],
         )
 
-        service.eng_all.pwm(55).time(1.5)
+        with self.assertLogs("test.motor", level="WARNING") as logs:
+            service.eng_all.pwm(55).time(1.5)
 
         self.assertEqual(len(connection.writes), 2)
         payload = json.loads(connection.writes[1])
@@ -174,6 +175,7 @@ class ArduinoServiceTests(unittest.TestCase):
         self.assertEqual(payload["args"]["pwm"], 55)
         self.assertEqual(payload["args"]["duration_ms"], 1500)
         sleep_mock.assert_called_once_with(1.5)
+        self.assertIn("При значениях ниже 60 двигатель может работать нестабильно", "\n".join(logs.output))
         service.close()
 
     def test_requested_port_failure_raises_original_error(self) -> None:

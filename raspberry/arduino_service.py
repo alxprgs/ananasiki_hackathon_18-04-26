@@ -31,6 +31,7 @@ except ImportError:  # pragma: no cover - проверяется через вн
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_CONNECT_WARMUP_SECONDS = 2.0
+LOW_MOTOR_PWM_WARNING_THRESHOLD = 60
 UnitName = Literal["mm", "cm", "m"]
 MotorTarget = Literal["all", "left", "right"]
 WallSide = Literal["left", "right"]
@@ -955,6 +956,14 @@ class ArduinoService:
         pwm: int,
         duration_ms: int | None = None,
     ) -> dict[str, Any]:
+        if 0 < abs(pwm) < LOW_MOTOR_PWM_WARNING_THRESHOLD:
+            self._logger.warning(
+                "Для команды мотора %s задан PWM %s. При значениях ниже %s двигатель может работать нестабильно "
+                "или вообще не запуститься из-за нагрузки, питания или драйвера.",
+                target,
+                pwm,
+                LOW_MOTOR_PWM_WARNING_THRESHOLD,
+            )
         params: dict[str, Any] = {"target": target, "pwm": pwm}
         if duration_ms is not None:
             params["duration_ms"] = duration_ms
