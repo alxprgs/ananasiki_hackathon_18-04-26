@@ -201,7 +201,7 @@ struct StepperRuntimeState {
   unsigned long stepIntervalUs;
 };
 
-constexpr size_t REQUEST_BUFFER_SIZE = 220;
+constexpr size_t REQUEST_BUFFER_SIZE = 70;
 char gRequestBuffer[REQUEST_BUFFER_SIZE];
 size_t gRequestLength = 0;
 bool gRequestOverflow = false;
