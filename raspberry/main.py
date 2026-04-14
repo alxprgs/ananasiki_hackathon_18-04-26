@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 
 try:
     from .arduino_service import ArduinoService
@@ -10,8 +11,12 @@ except ImportError:  # pragma: no cover - позволяет запускать 
 
 def main():
     with ArduinoService(port="COM3") as robot:
-        robot.start_activity_session(include_map=True)
-        robot.eng_r.pwm(100).time(10)
+        while True:
+            print(f"Растояние первого датчика в мм: {robot.distance_sensor.get(1)}")
+            time.sleep(1)
+            #print(f"Растояние второго датчика в мм: {robot.distance_sensor.get(2)}")
 
-if __name__ == "__main__":  
+
+
+if __name__ == "__main__":
     main()
