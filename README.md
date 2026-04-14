@@ -1294,13 +1294,19 @@ pip install -r raspberry/requirements.txt
 ## Демонстрационный запуск
 
 ```bash
-python -m raspberry.main --motion-percent 30 --motion-seconds 1.0
+python -m raspberry.main --port COM3
 ```
 
-Пример с включением точки доступа:
+Быстрая диагностика обоих датчиков с итоговой сводкой:
 
 ```bash
-python -m raspberry.main --enable-ap --ap-ssid RescueMazeRobot --ap-password RescueMaze123
+python -m raspberry.main --diagnose-sensors --samples 5 --interval 0.5
+```
+
+Проверка только датчика 1:
+
+```bash
+python -m raspberry.main --diagnose-sensors --sensors 1 --samples 10 --interval 0.2
 ```
 
 ## Тесты
