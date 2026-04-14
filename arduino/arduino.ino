@@ -1,6 +1,26 @@
 #include <Arduino.h>
+#include <avr/pgmspace.h>
+
+#ifndef _SS_MAX_RX_BUFF
+#define _SS_MAX_RX_BUFF 16
+#endif
+
+#ifndef SERVO_FEATURE_ENABLED
+#define SERVO_FEATURE_ENABLED 0
+#endif
+
 #include <SoftwareSerial.h>
+#if SERVO_FEATURE_ENABLED
+#if defined(__has_include)
+#if __has_include(<Servo.h>)
 #include <Servo.h>
+#else
+#error "SERVO_FEATURE_ENABLED requires Servo.h. Install the Servo library or set SERVO_FEATURE_ENABLED to 0."
+#endif
+#else
+#include <Servo.h>
+#endif
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,7 +84,7 @@ constexpr long STEPPER_STEPS_PER_REV = 200L;
 constexpr bool SWAP_TRACK_MOTORS = false;
 constexpr bool LEFT_TRACK_INVERTED = false;
 constexpr bool RIGHT_TRACK_INVERTED = true;
-constexpr bool SERVO_ENABLED = false;
+constexpr bool SERVO_ENABLED = SERVO_FEATURE_ENABLED != 0;
 constexpr bool RELAY_ENABLED = false;
 constexpr bool STEPPER_ENABLED = false;
 constexpr bool STEPPER_ENABLE_ACTIVE_LOW = true;
@@ -201,7 +221,7 @@ struct StepperRuntimeState {
   unsigned long stepIntervalUs;
 };
 
-constexpr size_t REQUEST_BUFFER_SIZE = 220;
+constexpr size_t REQUEST_BUFFER_SIZE = 192;
 char gRequestBuffer[REQUEST_BUFFER_SIZE];
 size_t gRequestLength = 0;
 bool gRequestOverflow = false;
@@ -293,9 +313,11 @@ MotorRuntimeState gRightMotor = {0, false, 0, false, 0, 0, 0, 0};
 
 StepperRuntimeState gStepper = {false, false, false, false, 0, 0, 0, 0};
 
+#if SERVO_FEATURE_ENABLED
 Servo gServo;
 bool gServoAttached = false;
 int gServoAngle = 90;
+#endif
 bool gRelayEnabled = false;
 unsigned long gLastValidCommandAtMs = 0;
 bool gWatchdogTriggered = false;
@@ -315,6 +337,10 @@ const MotorPins& rightMotorPins() {
 // Безопасная проверка дедлайна, устойчивая к переполнению millis()/micros().
 bool hasElapsed(unsigned long nowValue, unsigned long deadlineValue) {
   return static_cast<long>(nowValue - deadlineValue) >= 0;
+}
+
+bool equalsFlash(const char* value, PGM_P flashValue) {
+  return strcmp_P(value, flashValue) == 0;
 }
 
 // Все команды мощности насильно ограничиваем диапазоном -100..100 процентов.
@@ -441,20 +467,20 @@ long pulseWidthToDistanceMm(const DistanceSensorState& sensor, unsigned long pul
   return static_cast<long>((pulseWidthUs * 343UL) / 2000UL);
 }
 
-const char* sensorKindName(const DistanceSensorState& sensor) {
+const __FlashStringHelper* sensorKindName(const DistanceSensorState& sensor) {
   switch (sensor.kind) {
     case DISTANCE_SENSOR_HC_SR04:
-      return "hc_sr04";
+      return F("hc_sr04");
     case DISTANCE_SENSOR_URM37:
-      return "urm37";
+      return F("urm37");
     case DISTANCE_SENSOR_DISABLED:
     default:
-      return "disabled";
+      return F("disabled");
   }
 }
 
-const char* urm37MeasureModeName(Urm37MeasureMode mode) {
-  return mode == URM37_MEASURE_AUTO ? "auto" : "pwm_passive";
+const __FlashStringHelper* urm37MeasureModeName(Urm37MeasureMode mode) {
+  return mode == URM37_MEASURE_AUTO ? F("auto") : F("pwm_passive");
 }
 
 void printNullablePin(uint8_t pin) {
@@ -690,7 +716,37 @@ void sendUrm37SettingsResponse(long requestId, uint8_t sensorId, const DistanceS
  * Поля code и message нужны не только для человека, но и для Raspberry Pi:
  * python-сервис может различать unsupported, bad_request и другие ситуации.
  */
+void sendErrorResponse(long requestId, const __FlashStringHelper* code, const __FlashStringHelper* message) {
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.print(F(",\"ok\":false,\"error\":{\"code\":\""));
+  Serial.print(code);
+  Serial.print(F("\",\"message\":\""));
+  Serial.print(message);
+  Serial.println(F("\"}}"));
+}
+
 void sendErrorResponse(long requestId, const char* code, const char* message) {
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.print(F(",\"ok\":false,\"error\":{\"code\":\""));
+  Serial.print(code);
+  Serial.print(F("\",\"message\":\""));
+  Serial.print(message);
+  Serial.println(F("\"}}"));
+}
+
+void sendErrorResponse(long requestId, const __FlashStringHelper* code, const char* message) {
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.print(F(",\"ok\":false,\"error\":{\"code\":\""));
+  Serial.print(code);
+  Serial.print(F("\",\"message\":\""));
+  Serial.print(message);
+  Serial.println(F("\"}}"));
+}
+
+void sendErrorResponse(long requestId, const char* code, const __FlashStringHelper* message) {
   Serial.print(F("{\"id\":"));
   Serial.print(requestId);
   Serial.print(F(",\"ok\":false,\"error\":{\"code\":\""));
@@ -714,17 +770,22 @@ void sendEmptyOkResponse(long requestId) {
  * функций под строго контролируемый формат сообщений от Raspberry Pi.
  * Для AVR это выгодно по памяти и по предсказуемости поведения.
  */
-bool findFieldValue(const char* payload, const char* key, const char*& valueStart) {
+bool findFieldValue(const char* payload, PGM_P key, const char*& valueStart) {
   char pattern[32];
-  int length = snprintf(pattern, sizeof(pattern), "\"%s\":", key);
-  if (length <= 0 || length >= static_cast<int>(sizeof(pattern))) {
+  size_t keyLength = strlen_P(key);
+  if (keyLength == 0 || keyLength + 4 > sizeof(pattern)) {
     return false;
   }
+  pattern[0] = '"';
+  memcpy_P(pattern + 1, key, keyLength);
+  pattern[keyLength + 1] = '"';
+  pattern[keyLength + 2] = ':';
+  pattern[keyLength + 3] = '\0';
   const char* found = strstr(payload, pattern);
   if (found == nullptr) {
     return false;
   }
-  valueStart = found + length;
+  valueStart = found + keyLength + 3;
   while (*valueStart == ' ') {
     ++valueStart;
   }
@@ -732,7 +793,7 @@ bool findFieldValue(const char* payload, const char* key, const char*& valueStar
 }
 
 // Вытаскивает "сырой" токен числа, чтобы потом преобразовать его в long или double.
-bool extractNumberToken(const char* payload, const char* key, char* out, size_t outSize) {
+bool extractNumberToken(const char* payload, PGM_P key, char* out, size_t outSize) {
   const char* start = nullptr;
   if (!findFieldValue(payload, key, start)) {
     return false;
@@ -750,7 +811,7 @@ bool extractNumberToken(const char* payload, const char* key, char* out, size_t 
 }
 
 // Извлечение целого числа из JSON-поля.
-bool extractLongField(const char* payload, const char* key, long& value) {
+bool extractLongField(const char* payload, PGM_P key, long& value) {
   char token[24];
   if (!extractNumberToken(payload, key, token, sizeof(token))) {
     return false;
@@ -765,7 +826,7 @@ bool extractLongField(const char* payload, const char* key, long& value) {
 }
 
 // Извлечение числа с плавающей точкой. Нужен в первую очередь для rpm шаговика.
-bool extractDoubleField(const char* payload, const char* key, double& value) {
+bool extractDoubleField(const char* payload, PGM_P key, double& value) {
   char token[24];
   if (!extractNumberToken(payload, key, token, sizeof(token))) {
     return false;
@@ -775,16 +836,16 @@ bool extractDoubleField(const char* payload, const char* key, double& value) {
 }
 
 // Извлечение bool в формате true/false.
-bool extractBoolField(const char* payload, const char* key, bool& value) {
+bool extractBoolField(const char* payload, PGM_P key, bool& value) {
   const char* start = nullptr;
   if (!findFieldValue(payload, key, start)) {
     return false;
   }
-  if (strncmp(start, "true", 4) == 0) {
+  if (strncmp_P(start, PSTR("true"), 4) == 0) {
     value = true;
     return true;
   }
-  if (strncmp(start, "false", 5) == 0) {
+  if (strncmp_P(start, PSTR("false"), 5) == 0) {
     value = false;
     return true;
   }
@@ -792,7 +853,7 @@ bool extractBoolField(const char* payload, const char* key, bool& value) {
 }
 
 // Извлечение строки без полноценной обработки escape-последовательностей.
-bool extractStringField(const char* payload, const char* key, char* out, size_t outSize) {
+bool extractStringField(const char* payload, PGM_P key, char* out, size_t outSize) {
   const char* start = nullptr;
   if (!findFieldValue(payload, key, start) || *start != '"') {
     return false;
@@ -896,16 +957,16 @@ void setMotorState(MotorRuntimeState& state, const MotorPins& pins, int percent,
 
 // Разводим high-level команду по одному или двум каналам.
 void setMotorCommand(const char* target, int percent, long durationMs, bool rampEnabled = false, int startPercent = 0, long rampDurationMs = 0) {
-  if (strcmp(target, "all") == 0) {
+  if (equalsFlash(target, PSTR("all"))) {
     setMotorState(gLeftMotor, leftMotorPins(), percent, durationMs, rampEnabled, startPercent, rampDurationMs);
     setMotorState(gRightMotor, rightMotorPins(), percent, durationMs, rampEnabled, startPercent, rampDurationMs);
     return;
   }
-  if (strcmp(target, "left") == 0) {
+  if (equalsFlash(target, PSTR("left"))) {
     setMotorState(gLeftMotor, leftMotorPins(), percent, durationMs, rampEnabled, startPercent, rampDurationMs);
     return;
   }
-  if (strcmp(target, "right") == 0) {
+  if (equalsFlash(target, PSTR("right"))) {
     setMotorState(gRightMotor, rightMotorPins(), percent, durationMs, rampEnabled, startPercent, rampDurationMs);
     return;
   }
@@ -1215,9 +1276,9 @@ bool sensorDistanceAvailable(int sensorIndex, long& distanceMm) {
 
 bool extractSensorIndex(long requestId, const char* payload, int& sensorIndex) {
   long sensorId = 0;
-  if (!extractLongField(payload, "sensor", sensorId) || sensorId < 1 ||
+  if (!extractLongField(payload, PSTR("sensor"), sensorId) || sensorId < 1 ||
       sensorId > static_cast<long>(Config::DISTANCE_SENSOR_COUNT)) {
-    sendErrorResponse(requestId, "bad_request", "sensor must be in range 1..4");
+    sendErrorResponse(requestId, F("bad_request"), F("sensor must be in range 1..4"));
     return false;
   }
   sensorIndex = static_cast<int>(sensorId) - 1;
@@ -1226,15 +1287,15 @@ bool extractSensorIndex(long requestId, const char* payload, int& sensorIndex) {
 
 bool ensureUrm37SerialCommandSupported(long requestId, const DistanceSensorState& sensor) {
   if (!sensor.enabled || sensor.kind == DISTANCE_SENSOR_DISABLED || !sensorHasDistancePins(sensor)) {
-    sendErrorResponse(requestId, "not_configured", "distance sensor slot is disabled");
+    sendErrorResponse(requestId, F("not_configured"), F("distance sensor slot is disabled"));
     return false;
   }
   if (sensor.kind != DISTANCE_SENSOR_URM37) {
-    sendErrorResponse(requestId, "unsupported", "selected sensor is not URM37");
+    sendErrorResponse(requestId, F("unsupported"), F("selected sensor is not URM37"));
     return false;
   }
   if (!sensorHasSerialPins(sensor)) {
-    sendErrorResponse(requestId, "not_configured", "URM37 serial pins are not configured");
+    sendErrorResponse(requestId, F("not_configured"), F("URM37 serial pins are not configured"));
     return false;
   }
   return true;
@@ -1333,13 +1394,13 @@ void handleDistanceRequest(long requestId, const char* payload) {
   uint8_t sensorId = static_cast<uint8_t>(sensorIndex + 1);
   DistanceSensorState& sensor = gSensors[sensorIndex];
   if (!sensor.enabled || sensor.kind == DISTANCE_SENSOR_DISABLED || !sensorHasDistancePins(sensor)) {
-    sendErrorResponse(requestId, "not_configured", "distance sensor slot is disabled");
+    sendErrorResponse(requestId, F("not_configured"), F("distance sensor slot is disabled"));
     return;
   }
 
   long distanceMm = 0;
   if (!sensorDistanceAvailable(sensorIndex, distanceMm)) {
-    sendErrorResponse(requestId, "sensor_timeout", "distance measurement is unavailable");
+    sendErrorResponse(requestId, F("sensor_timeout"), F("distance measurement is unavailable"));
     return;
   }
 
@@ -1365,7 +1426,7 @@ void handleUrm37TemperatureRequest(long requestId, const char* payload) {
 
   float temperatureC = 0.0f;
   if (!readUrm37TemperatureC(sensor, temperatureC)) {
-    sendErrorResponse(requestId, "sensor_timeout", "URM37 temperature is unavailable");
+    sendErrorResponse(requestId, F("sensor_timeout"), F("URM37 temperature is unavailable"));
     return;
   }
 
@@ -1390,7 +1451,7 @@ void handleUrm37SettingsRequest(long requestId, const char* payload) {
   }
 
   if (!refreshUrm37SettingsFromSensor(sensor)) {
-    sendErrorResponse(requestId, "sensor_timeout", "URM37 settings are unavailable");
+    sendErrorResponse(requestId, F("sensor_timeout"), F("URM37 settings are unavailable"));
     return;
   }
 
@@ -1411,52 +1472,52 @@ void handleUrm37SettingsUpdateRequest(long requestId, const char* payload) {
   bool hasAnyUpdate = false;
 
   char measureModeText[20];
-  bool hasMeasureMode = extractStringField(payload, "measure_mode", measureModeText, sizeof(measureModeText));
+  bool hasMeasureMode = extractStringField(payload, PSTR("measure_mode"), measureModeText, sizeof(measureModeText));
   Urm37MeasureMode nextMeasureMode = sensor.urm37MeasureMode;
   if (hasMeasureMode) {
     hasAnyUpdate = true;
-    if (strcmp(measureModeText, "pwm_passive") == 0) {
+    if (equalsFlash(measureModeText, PSTR("pwm_passive"))) {
       nextMeasureMode = URM37_MEASURE_PWM_PASSIVE;
-    } else if (strcmp(measureModeText, "auto") == 0) {
+    } else if (equalsFlash(measureModeText, PSTR("auto"))) {
       nextMeasureMode = URM37_MEASURE_AUTO;
     } else {
-      sendErrorResponse(requestId, "bad_request", "measure_mode must be pwm_passive or auto");
+      sendErrorResponse(requestId, F("bad_request"), F("measure_mode must be pwm_passive or auto"));
       return;
     }
   }
 
   long autoMeasureIntervalMs = 0;
-  bool hasAutoMeasureInterval = extractLongField(payload, "auto_measure_interval_ms", autoMeasureIntervalMs);
+  bool hasAutoMeasureInterval = extractLongField(payload, PSTR("auto_measure_interval_ms"), autoMeasureIntervalMs);
   if (hasAutoMeasureInterval) {
     hasAnyUpdate = true;
     if (autoMeasureIntervalMs < 25 || autoMeasureIntervalMs > 255) {
-      sendErrorResponse(requestId, "bad_request", "auto_measure_interval_ms must be in range 25..255");
+      sendErrorResponse(requestId, F("bad_request"), F("auto_measure_interval_ms must be in range 25..255"));
       return;
     }
   }
 
   long compareDistanceCm = 0;
-  bool hasCompareDistance = extractLongField(payload, "compare_distance_cm", compareDistanceCm);
+  bool hasCompareDistance = extractLongField(payload, PSTR("compare_distance_cm"), compareDistanceCm);
   if (hasCompareDistance) {
     hasAnyUpdate = true;
     if (compareDistanceCm < 0 || compareDistanceCm > 1000) {
-      sendErrorResponse(requestId, "bad_request", "compare_distance_cm must be in range 0..1000");
+      sendErrorResponse(requestId, F("bad_request"), F("compare_distance_cm must be in range 0..1000"));
       return;
     }
   }
 
   long sensitivity = 0;
-  bool hasSensitivity = extractLongField(payload, "sensitivity", sensitivity);
+  bool hasSensitivity = extractLongField(payload, PSTR("sensitivity"), sensitivity);
   if (hasSensitivity) {
     hasAnyUpdate = true;
     if (sensitivity < 10 || sensitivity > 200) {
-      sendErrorResponse(requestId, "bad_request", "sensitivity must be in range 10..200");
+      sendErrorResponse(requestId, F("bad_request"), F("sensitivity must be in range 10..200"));
       return;
     }
   }
 
   if (!hasAnyUpdate) {
-    sendErrorResponse(requestId, "bad_request", "at least one URM37 setting must be provided");
+    sendErrorResponse(requestId, F("bad_request"), F("at least one URM37 setting must be provided"));
     return;
   }
 
@@ -1464,7 +1525,7 @@ void handleUrm37SettingsUpdateRequest(long requestId, const char* payload) {
     uint16_t boundedCompareDistance = static_cast<uint16_t>(compareDistanceCm);
     if (!writeUrm37EepromByte(sensor, 0x00, static_cast<uint8_t>(boundedCompareDistance & 0xFFU)) ||
         !writeUrm37EepromByte(sensor, 0x01, static_cast<uint8_t>((boundedCompareDistance >> 8) & 0xFFU))) {
-      sendErrorResponse(requestId, "sensor_timeout", "failed to write URM37 compare distance");
+      sendErrorResponse(requestId, F("sensor_timeout"), F("failed to write URM37 compare distance"));
       return;
     }
     sensor.urm37CompareDistanceCm = boundedCompareDistance;
@@ -1473,7 +1534,7 @@ void handleUrm37SettingsUpdateRequest(long requestId, const char* payload) {
   if (hasMeasureMode) {
     uint8_t modeByte = nextMeasureMode == URM37_MEASURE_AUTO ? 0xAA : 0xBB;
     if (!writeUrm37EepromByte(sensor, 0x02, modeByte)) {
-      sendErrorResponse(requestId, "sensor_timeout", "failed to write URM37 measure mode");
+      sendErrorResponse(requestId, F("sensor_timeout"), F("failed to write URM37 measure mode"));
       return;
     }
     sensor.urm37MeasureMode = nextMeasureMode;
@@ -1481,7 +1542,7 @@ void handleUrm37SettingsUpdateRequest(long requestId, const char* payload) {
 
   if (hasAutoMeasureInterval) {
     if (!writeUrm37EepromByte(sensor, 0x04, static_cast<uint8_t>(autoMeasureIntervalMs))) {
-      sendErrorResponse(requestId, "sensor_timeout", "failed to write URM37 auto interval");
+      sendErrorResponse(requestId, F("sensor_timeout"), F("failed to write URM37 auto interval"));
       return;
     }
     sensor.urm37AutoIntervalMs = static_cast<uint8_t>(autoMeasureIntervalMs);
@@ -1525,30 +1586,30 @@ void handleSetMotor(long requestId, const char* payload) {
   bool hasStartPwm = false;
   bool hasRampDuration = false;
 
-  if (!extractStringField(payload, "target", target, sizeof(target))) {
-    sendErrorResponse(requestId, "bad_request", "поле target обязательно");
+  if (!extractStringField(payload, PSTR("target"), target, sizeof(target))) {
+    sendErrorResponse(requestId, F("bad_request"), "поле target обязательно");
     return;
   }
 
-  if (strcmp(target, "all") != 0 && strcmp(target, "left") != 0 && strcmp(target, "right") != 0) {
-    sendErrorResponse(requestId, "bad_request", "target должен быть all, left или right");
+  if (!equalsFlash(target, PSTR("all")) && !equalsFlash(target, PSTR("left")) && !equalsFlash(target, PSTR("right"))) {
+    sendErrorResponse(requestId, F("bad_request"), "target должен быть all, left или right");
     return;
   }
 
-  if (!extractLongField(payload, "pwm", pwm)) {
-    sendErrorResponse(requestId, "bad_request", "поле pwm обязательно");
+  if (!extractLongField(payload, PSTR("pwm"), pwm)) {
+    sendErrorResponse(requestId, F("bad_request"), "поле pwm обязательно");
     return;
   }
 
-  if (!extractLongField(payload, "duration_ms", durationMs)) {
+  if (!extractLongField(payload, PSTR("duration_ms"), durationMs)) {
     durationMs = 0;
   }
   if (durationMs < 0) {
     durationMs = 0;
   }
 
-  hasStartPwm = extractLongField(payload, "start_pwm", startPwm);
-  hasRampDuration = extractLongField(payload, "ramp_duration_ms", rampDurationMs);
+  hasStartPwm = extractLongField(payload, PSTR("start_pwm"), startPwm);
+  hasRampDuration = extractLongField(payload, PSTR("ramp_duration_ms"), rampDurationMs);
   if (!hasRampDuration) {
     rampDurationMs = 0;
   }
@@ -1556,11 +1617,11 @@ void handleSetMotor(long requestId, const char* payload) {
     rampDurationMs = 0;
   }
   if (hasRampDuration && rampDurationMs > 0 && !hasStartPwm) {
-    sendErrorResponse(requestId, "bad_request", "для ramp нужно поле start_pwm");
+    sendErrorResponse(requestId, F("bad_request"), "для ramp нужно поле start_pwm");
     return;
   }
   if (hasRampDuration && durationMs > 0 && rampDurationMs > durationMs) {
-    sendErrorResponse(requestId, "bad_request", "ramp_duration_ms не должен превышать duration_ms");
+    sendErrorResponse(requestId, F("bad_request"), "ramp_duration_ms не должен превышать duration_ms");
     return;
   }
 
@@ -1586,13 +1647,18 @@ void handleSetMotor(long requestId, const char* payload) {
 
 // Управление сервой вынесено отдельно, чтобы можно было честно вернуть unsupported.
 void handleSetServo(long requestId, const char* payload) {
+#if !SERVO_FEATURE_ENABLED
+  (void)payload;
+  sendErrorResponse(requestId, F("unsupported"), F("сервопривод не настроен"));
+  return;
+#else
   if (!Config::SERVO_ENABLED) {
     sendErrorResponse(requestId, "unsupported", "сервопривод не настроен");
     return;
   }
 
   long angle = 0;
-  if (!extractLongField(payload, "angle_deg", angle)) {
+  if (!extractLongField(payload, PSTR("angle_deg"), angle)) {
     sendErrorResponse(requestId, "bad_request", "поле angle_deg обязательно");
     return;
   }
@@ -1616,18 +1682,19 @@ void handleSetServo(long requestId, const char* payload) {
   Serial.print(F(",\"ok\":true,\"data\":{\"angle_deg\":"));
   Serial.print(gServoAngle);
   Serial.println(F("}}"));
+#endif
 }
 
 // Управление реле бинарное: либо включено, либо выключено.
 void handleSetRelay(long requestId, const char* payload) {
   if (!Config::RELAY_ENABLED) {
-    sendErrorResponse(requestId, "unsupported", "реле не настроено");
+    sendErrorResponse(requestId, F("unsupported"), "реле не настроено");
     return;
   }
 
   bool enabled = false;
-  if (!extractBoolField(payload, "enabled", enabled)) {
-    sendErrorResponse(requestId, "bad_request", "поле enabled обязательно");
+  if (!extractBoolField(payload, PSTR("enabled"), enabled)) {
+    sendErrorResponse(requestId, F("bad_request"), "поле enabled обязательно");
     return;
   }
 
@@ -1649,40 +1716,40 @@ void handleSetRelay(long requestId, const char* payload) {
  */
 void handleStepperMove(long requestId, const char* payload) {
   if (!Config::STEPPER_ENABLED) {
-    sendErrorResponse(requestId, "unsupported", "шаговый двигатель не настроен");
+    sendErrorResponse(requestId, F("unsupported"), "шаговый двигатель не настроен");
     return;
   }
 
   double rpmValue = 0.0;
-  if (!extractDoubleField(payload, "rpm", rpmValue) || rpmValue <= 0.0) {
-    sendErrorResponse(requestId, "bad_request", "rpm должно быть положительным");
+  if (!extractDoubleField(payload, PSTR("rpm"), rpmValue) || rpmValue <= 0.0) {
+    sendErrorResponse(requestId, F("bad_request"), "rpm должно быть положительным");
     return;
   }
 
   char direction[10];
-  if (!extractStringField(payload, "direction", direction, sizeof(direction))) {
-    strcpy(direction, "forward");
+  if (!extractStringField(payload, PSTR("direction"), direction, sizeof(direction))) {
+    strcpy_P(direction, PSTR("forward"));
   }
 
   bool forward = true;
-  if (strcmp(direction, "forward") == 0) {
+  if (equalsFlash(direction, PSTR("forward"))) {
     forward = true;
-  } else if (strcmp(direction, "reverse") == 0) {
+  } else if (equalsFlash(direction, PSTR("reverse"))) {
     forward = false;
   } else {
-    sendErrorResponse(requestId, "bad_request", "direction должно быть forward или reverse");
+    sendErrorResponse(requestId, F("bad_request"), "direction должно быть forward или reverse");
     return;
   }
 
   long steps = 0;
-  bool hasSteps = extractLongField(payload, "steps", steps);
+  bool hasSteps = extractLongField(payload, PSTR("steps"), steps);
   if (hasSteps && steps < 0) {
     steps = abs(steps);
     forward = !forward;
   }
 
   long durationMs = 0;
-  if (!extractLongField(payload, "duration_ms", durationMs)) {
+  if (!extractLongField(payload, PSTR("duration_ms"), durationMs)) {
     durationMs = 0;
   }
   if (durationMs < 0) {
@@ -1722,82 +1789,82 @@ void handleRequest(const char* payload) {
   long requestId = 0;
   char operation[20];
 
-  if (!extractLongField(payload, "id", requestId)) {
-    sendErrorResponse(0, "bad_request", "поле id обязательно");
+  if (!extractLongField(payload, PSTR("id"), requestId)) {
+    sendErrorResponse(0, F("bad_request"), "поле id обязательно");
     return;
   }
 
-  if (!extractStringField(payload, "op", operation, sizeof(operation))) {
-    sendErrorResponse(requestId, "bad_request", "поле op обязательно");
+  if (!extractStringField(payload, PSTR("op"), operation, sizeof(operation))) {
+    sendErrorResponse(requestId, F("bad_request"), "поле op обязательно");
     return;
   }
 
   markCommandReceived();
 
-  if (strcmp(operation, "ping") == 0) {
+  if (equalsFlash(operation, PSTR("ping"))) {
     handlePing(requestId);
     return;
   }
 
-  if (strcmp(operation, "get_distance") == 0) {
+  if (equalsFlash(operation, PSTR("get_distance"))) {
     handleDistanceRequest(requestId, payload);
     return;
   }
 
-  if (strcmp(operation, "get_urm37_temperature") == 0) {
+  if (equalsFlash(operation, PSTR("get_urm37_temperature"))) {
     handleUrm37TemperatureRequest(requestId, payload);
     return;
   }
 
-  if (strcmp(operation, "get_urm37_settings") == 0) {
+  if (equalsFlash(operation, PSTR("get_urm37_settings"))) {
     handleUrm37SettingsRequest(requestId, payload);
     return;
   }
 
-  if (strcmp(operation, "set_urm37_settings") == 0) {
+  if (equalsFlash(operation, PSTR("set_urm37_settings"))) {
     handleUrm37SettingsUpdateRequest(requestId, payload);
     return;
   }
 
-  if (strcmp(operation, "get_button") == 0) {
+  if (equalsFlash(operation, PSTR("get_button"))) {
     handleButtonRequest(requestId);
     return;
   }
 
-  if (strcmp(operation, "set_motor") == 0) {
+  if (equalsFlash(operation, PSTR("set_motor"))) {
     handleSetMotor(requestId, payload);
     return;
   }
 
-  if (strcmp(operation, "stop_all") == 0) {
+  if (equalsFlash(operation, PSTR("stop_all"))) {
     stopAllMotion();
     sendEmptyOkResponse(requestId);
     return;
   }
 
-  if (strcmp(operation, "get_status") == 0) {
+  if (equalsFlash(operation, PSTR("get_status"))) {
     sendStatusResponse(requestId);
     return;
   }
 
-  if (strcmp(operation, "set_servo") == 0) {
+  if (equalsFlash(operation, PSTR("set_servo"))) {
     handleSetServo(requestId, payload);
     return;
   }
 
-  if (strcmp(operation, "set_relay") == 0) {
+  if (equalsFlash(operation, PSTR("set_relay"))) {
     handleSetRelay(requestId, payload);
     return;
   }
 
-  if (strcmp(operation, "stepper_move") == 0) {
+  if (equalsFlash(operation, PSTR("stepper_move"))) {
     handleStepperMove(requestId, payload);
     return;
   }
 
-  if (strcmp(operation, "stepper_stop") == 0) {
+  if (equalsFlash(operation, PSTR("stepper_stop"))) {
     if (!Config::STEPPER_ENABLED) {
-      sendErrorResponse(requestId, "unsupported", "шаговый двигатель не настроен");
+      sendErrorResponse(requestId, F("unsupported"), "шаговый двигатель не настроен");
       return;
     }
     stopStepper();
@@ -1805,7 +1872,7 @@ void handleRequest(const char* payload) {
     return;
   }
 
-  sendErrorResponse(requestId, "unknown_op", "операция не поддерживается");
+  sendErrorResponse(requestId, F("unknown_op"), "операция не поддерживается");
 }
 
 /*
@@ -1827,7 +1894,7 @@ void readSerialRequests() {
 
     if (incoming == '\n') {
       if (gRequestOverflow) {
-        sendErrorResponse(0, "bad_request", "запрос слишком длинный");
+        sendErrorResponse(0, F("bad_request"), "запрос слишком длинный");
       } else if (gRequestLength > 0) {
         gRequestBuffer[gRequestLength] = '\0';
         handleRequest(gRequestBuffer);
@@ -1887,11 +1954,13 @@ void setupPins() {
 
   pinMode(Config::BUTTON_PIN, INPUT_PULLUP);
 
+  #if SERVO_FEATURE_ENABLED
   if (Config::SERVO_ENABLED) {
     gServo.attach(Config::SERVO_PIN);
     gServo.write(gServoAngle);
     gServoAttached = true;
   }
+  #endif
 
   if (Config::RELAY_ENABLED) {
     pinMode(Config::RELAY_PIN, OUTPUT);

@@ -1309,6 +1309,14 @@ print(telemetry["power"]["power_good_now"])
 
 ### Как прошить плату
 
+Минимальная проверка сборки для `Arduino Uno` из корня репозитория:
+
+```powershell
+& "C:\arduino-cli\arduino-cli.exe" compile --fqbn arduino:avr:uno --build-path .codex-arduino-build arduino
+```
+
+`Servo.h` теперь является опциональной зависимостью. Библиотека `Servo` нужна только если в прошивке явно включен `SERVO_FEATURE_ENABLED=1`; при значении по умолчанию `0` сборка для `Uno` проходит без установленной Servo-библиотеки.
+
 Базовый порядок работы такой:
 
 1. Открыть [arduino/arduino.ino](arduino/arduino.ino) и при необходимости поправить `Config`.
