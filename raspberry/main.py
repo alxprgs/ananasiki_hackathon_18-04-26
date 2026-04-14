@@ -11,10 +11,11 @@ except ImportError:  # pragma: no cover - позволяет запускать 
 
 def main():
     with ArduinoService(port="COM3") as robot:
+        robot.start_activity_session()
         while True:
             print(f"Растояние первого датчика в мм: {robot.distance_sensor.get(1)}")
+            print(f"Растояние второго датчика в мм: {robot.distance_sensor.get(2)}")
             time.sleep(1)
-            #print(f"Растояние второго датчика в мм: {robot.distance_sensor.get(2)}")
 
 
 
