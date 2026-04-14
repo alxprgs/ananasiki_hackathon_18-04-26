@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <SoftwareSerial.h>
 #include <Servo.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +55,10 @@ constexpr unsigned long SENSOR_SAMPLE_INTERVAL_MS = 75UL;
 constexpr unsigned long SENSOR_STALE_MS = 500UL;
 constexpr unsigned long SENSOR_TRIGGER_PULSE_US = 10UL;
 constexpr unsigned long SENSOR_ECHO_TIMEOUT_US = 25000UL;
+constexpr unsigned long URM37_TRIGGER_PULSE_US = 25UL;
+constexpr unsigned long URM37_ECHO_TIMEOUT_US = 50000UL;
+constexpr unsigned long URM37_SERIAL_BAUD = 9600UL;
+constexpr unsigned long URM37_SERIAL_TIMEOUT_MS = 120UL;
 constexpr unsigned long STEPPER_PULSE_HIGH_US = 10UL;
 constexpr long STEPPER_STEPS_PER_REV = 200L;
 constexpr bool SWAP_TRACK_MOTORS = false;
@@ -63,6 +68,10 @@ constexpr bool SERVO_ENABLED = false;
 constexpr bool RELAY_ENABLED = false;
 constexpr bool STEPPER_ENABLED = false;
 constexpr bool STEPPER_ENABLE_ACTIVE_LOW = true;
+constexpr uint8_t PIN_NOT_ASSIGNED = 0xFF;
+constexpr uint8_t DISTANCE_SENSOR_COUNT = 4;
+constexpr uint8_t URM37_DEFAULT_AUTO_INTERVAL_MS = 25;
+constexpr uint8_t URM37_DEFAULT_SENSITIVITY = 120;
 constexpr uint8_t SENSOR1_TRIG_PIN = 2;
 constexpr uint8_t SENSOR1_ECHO_PIN = 3;
 constexpr uint8_t LEFT_DIR_PIN = 4;
@@ -71,10 +80,22 @@ constexpr uint8_t RIGHT_PWM_PIN = 6;
 constexpr uint8_t RIGHT_DIR_PIN = 7;
 constexpr uint8_t SENSOR2_TRIG_PIN = 8;
 constexpr uint8_t SENSOR2_ECHO_PIN = 9;
+constexpr uint8_t SENSOR1_SERIAL_RX_PIN = PIN_NOT_ASSIGNED;
+constexpr uint8_t SENSOR1_SERIAL_TX_PIN = PIN_NOT_ASSIGNED;
 constexpr uint8_t SERVO_PIN = 10;
 constexpr uint8_t RELAY_PIN = 11;
 constexpr uint8_t STEPPER_STEP_PIN = 12;
 constexpr uint8_t STEPPER_DIR_PIN = 13;
+constexpr uint8_t SENSOR2_SERIAL_RX_PIN = A2;
+constexpr uint8_t SENSOR2_SERIAL_TX_PIN = A3;
+constexpr uint8_t SENSOR3_TRIG_PIN = PIN_NOT_ASSIGNED;
+constexpr uint8_t SENSOR3_ECHO_PIN = PIN_NOT_ASSIGNED;
+constexpr uint8_t SENSOR3_SERIAL_RX_PIN = PIN_NOT_ASSIGNED;
+constexpr uint8_t SENSOR3_SERIAL_TX_PIN = PIN_NOT_ASSIGNED;
+constexpr uint8_t SENSOR4_TRIG_PIN = PIN_NOT_ASSIGNED;
+constexpr uint8_t SENSOR4_ECHO_PIN = PIN_NOT_ASSIGNED;
+constexpr uint8_t SENSOR4_SERIAL_RX_PIN = PIN_NOT_ASSIGNED;
+constexpr uint8_t SENSOR4_SERIAL_TX_PIN = PIN_NOT_ASSIGNED;
 constexpr uint8_t STEPPER_ENABLE_PIN = A0;
 constexpr uint8_t BUTTON_PIN = A1;
 }  // namespace Config
@@ -93,9 +114,20 @@ constexpr uint8_t BUTTON_PIN = A1;
  */
 enum SensorStage : uint8_t {
   SENSOR_IDLE = 0,
-  SENSOR_TRIGGER_HIGH = 1,
-  SENSOR_WAIT_ECHO_HIGH = 2,
-  SENSOR_WAIT_ECHO_LOW = 3
+  SENSOR_TRIGGER_ACTIVE = 1,
+  SENSOR_WAIT_ECHO_ACTIVE = 2,
+  SENSOR_WAIT_ECHO_INACTIVE = 3
+};
+
+enum DistanceSensorKind : uint8_t {
+  DISTANCE_SENSOR_DISABLED = 0,
+  DISTANCE_SENSOR_HC_SR04 = 1,
+  DISTANCE_SENSOR_URM37 = 2
+};
+
+enum Urm37MeasureMode : uint8_t {
+  URM37_MEASURE_PWM_PASSIVE = 0,
+  URM37_MEASURE_AUTO = 1
 };
 
 struct MotorPins {
@@ -118,8 +150,16 @@ struct MotorPins {
  * данные сейчас лежат в памяти и можно ли их отдавать наружу.
  */
 struct DistanceSensorState {
+  bool enabled;
+  DistanceSensorKind kind;
   uint8_t trigPin;
   uint8_t echoPin;
+  uint8_t serialRxPin;
+  uint8_t serialTxPin;
+  Urm37MeasureMode urm37MeasureMode;
+  uint8_t urm37AutoIntervalMs;
+  uint16_t urm37CompareDistanceCm;
+  uint8_t urm37Sensitivity;
   SensorStage stage;
   bool valid;
   long lastDistanceMm;
@@ -166,10 +206,84 @@ char gRequestBuffer[REQUEST_BUFFER_SIZE];
 size_t gRequestLength = 0;
 bool gRequestOverflow = false;
 
-// Два датчика живут в массиве, так как их логика полностью одинакова.
-DistanceSensorState gSensors[2] = {
-    {Config::SENSOR1_TRIG_PIN, Config::SENSOR1_ECHO_PIN, SENSOR_IDLE, false, 0, 0, 0, 0, 0},
-    {Config::SENSOR2_TRIG_PIN, Config::SENSOR2_ECHO_PIN, SENSOR_IDLE, false, 0, 0, 0, 0, 0},
+// All distance slots live in one array so the polling and status code stay shared.
+DistanceSensorState gSensors[Config::DISTANCE_SENSOR_COUNT] = {
+    {
+        true,
+        DISTANCE_SENSOR_HC_SR04,
+        Config::SENSOR1_TRIG_PIN,
+        Config::SENSOR1_ECHO_PIN,
+        Config::SENSOR1_SERIAL_RX_PIN,
+        Config::SENSOR1_SERIAL_TX_PIN,
+        URM37_MEASURE_PWM_PASSIVE,
+        Config::URM37_DEFAULT_AUTO_INTERVAL_MS,
+        0,
+        Config::URM37_DEFAULT_SENSITIVITY,
+        SENSOR_IDLE,
+        false,
+        0,
+        0,
+        0,
+        0,
+        0,
+    },
+    {
+        true,
+        DISTANCE_SENSOR_URM37,
+        Config::SENSOR2_TRIG_PIN,
+        Config::SENSOR2_ECHO_PIN,
+        Config::SENSOR2_SERIAL_RX_PIN,
+        Config::SENSOR2_SERIAL_TX_PIN,
+        URM37_MEASURE_PWM_PASSIVE,
+        Config::URM37_DEFAULT_AUTO_INTERVAL_MS,
+        0,
+        Config::URM37_DEFAULT_SENSITIVITY,
+        SENSOR_IDLE,
+        false,
+        0,
+        0,
+        0,
+        0,
+        0,
+    },
+    {
+        false,
+        DISTANCE_SENSOR_DISABLED,
+        Config::SENSOR3_TRIG_PIN,
+        Config::SENSOR3_ECHO_PIN,
+        Config::SENSOR3_SERIAL_RX_PIN,
+        Config::SENSOR3_SERIAL_TX_PIN,
+        URM37_MEASURE_PWM_PASSIVE,
+        Config::URM37_DEFAULT_AUTO_INTERVAL_MS,
+        0,
+        Config::URM37_DEFAULT_SENSITIVITY,
+        SENSOR_IDLE,
+        false,
+        0,
+        0,
+        0,
+        0,
+        0,
+    },
+    {
+        false,
+        DISTANCE_SENSOR_DISABLED,
+        Config::SENSOR4_TRIG_PIN,
+        Config::SENSOR4_ECHO_PIN,
+        Config::SENSOR4_SERIAL_RX_PIN,
+        Config::SENSOR4_SERIAL_TX_PIN,
+        URM37_MEASURE_PWM_PASSIVE,
+        Config::URM37_DEFAULT_AUTO_INTERVAL_MS,
+        0,
+        Config::URM37_DEFAULT_SENSITIVITY,
+        SENSOR_IDLE,
+        false,
+        0,
+        0,
+        0,
+        0,
+        0,
+    },
 };
 int gActiveSensorIndex = -1;
 int gNextSensorIndex = 0;
@@ -223,6 +337,351 @@ unsigned long pwmToDutyCycle(int percent) {
 // Маленькая утилита для сериализации bool в JSON без внешних библиотек.
 void printBool(bool value) {
   Serial.print(value ? F("true") : F("false"));
+}
+
+bool isAssignedPin(uint8_t pin) {
+  return pin != Config::PIN_NOT_ASSIGNED;
+}
+
+bool isReservedSerialPin(uint8_t pin) {
+  return pin == 0 || pin == 1;
+}
+
+bool isBaseHardwarePin(uint8_t pin) {
+  if (!isAssignedPin(pin)) {
+    return false;
+  }
+  if (pin == Config::LEFT_DIR_PIN || pin == Config::LEFT_PWM_PIN || pin == Config::RIGHT_PWM_PIN ||
+      pin == Config::RIGHT_DIR_PIN || pin == Config::BUTTON_PIN) {
+    return true;
+  }
+  if (Config::SERVO_ENABLED && pin == Config::SERVO_PIN) {
+    return true;
+  }
+  if (Config::RELAY_ENABLED && pin == Config::RELAY_PIN) {
+    return true;
+  }
+  if (Config::STEPPER_ENABLED &&
+      (pin == Config::STEPPER_STEP_PIN || pin == Config::STEPPER_DIR_PIN || pin == Config::STEPPER_ENABLE_PIN)) {
+    return true;
+  }
+  return false;
+}
+
+void disableSensorSlot(DistanceSensorState& sensor) {
+  sensor.enabled = false;
+  sensor.kind = DISTANCE_SENSOR_DISABLED;
+  sensor.trigPin = Config::PIN_NOT_ASSIGNED;
+  sensor.echoPin = Config::PIN_NOT_ASSIGNED;
+  sensor.serialRxPin = Config::PIN_NOT_ASSIGNED;
+  sensor.serialTxPin = Config::PIN_NOT_ASSIGNED;
+  sensor.stage = SENSOR_IDLE;
+  sensor.valid = false;
+  sensor.lastDistanceMm = 0;
+  sensor.stageStartedUs = 0;
+  sensor.echoStartedUs = 0;
+  sensor.nextTriggerAtMs = 0;
+  sensor.lastSuccessAtMs = 0;
+}
+
+void clearSensorSerialPins(DistanceSensorState& sensor) {
+  sensor.serialRxPin = Config::PIN_NOT_ASSIGNED;
+  sensor.serialTxPin = Config::PIN_NOT_ASSIGNED;
+}
+
+bool sensorUsesConfiguredPin(const DistanceSensorState& sensor, uint8_t pin) {
+  if (!sensor.enabled || !isAssignedPin(pin)) {
+    return false;
+  }
+  return sensor.trigPin == pin || sensor.echoPin == pin || sensor.serialRxPin == pin || sensor.serialTxPin == pin;
+}
+
+bool sensorHasDistancePins(const DistanceSensorState& sensor) {
+  return sensor.enabled && sensor.kind != DISTANCE_SENSOR_DISABLED && isAssignedPin(sensor.trigPin) &&
+         isAssignedPin(sensor.echoPin);
+}
+
+bool sensorHasSerialPins(const DistanceSensorState& sensor) {
+  return sensor.enabled && sensor.kind == DISTANCE_SENSOR_URM37 && isAssignedPin(sensor.serialRxPin) &&
+         isAssignedPin(sensor.serialTxPin);
+}
+
+bool sensorIsUrm37(const DistanceSensorState& sensor) {
+  return sensor.enabled && sensor.kind == DISTANCE_SENSOR_URM37;
+}
+
+bool sensorTriggerActiveLevel(const DistanceSensorState& sensor) {
+  return sensor.kind == DISTANCE_SENSOR_HC_SR04;
+}
+
+bool sensorEchoActiveLevel(const DistanceSensorState& sensor) {
+  return sensor.kind == DISTANCE_SENSOR_HC_SR04;
+}
+
+unsigned long sensorTriggerPulseUs(const DistanceSensorState& sensor) {
+  return sensor.kind == DISTANCE_SENSOR_URM37 ? Config::URM37_TRIGGER_PULSE_US : Config::SENSOR_TRIGGER_PULSE_US;
+}
+
+unsigned long sensorEchoTimeoutUs(const DistanceSensorState& sensor) {
+  return sensor.kind == DISTANCE_SENSOR_URM37 ? Config::URM37_ECHO_TIMEOUT_US : Config::SENSOR_ECHO_TIMEOUT_US;
+}
+
+unsigned long sensorEchoWaitTimeoutUs(const DistanceSensorState& sensor) {
+  if (sensor.kind == DISTANCE_SENSOR_URM37 && sensor.urm37MeasureMode == URM37_MEASURE_AUTO) {
+    return static_cast<unsigned long>(sensor.urm37AutoIntervalMs) * 1000UL + sensorEchoTimeoutUs(sensor);
+  }
+  return sensorEchoTimeoutUs(sensor);
+}
+
+long pulseWidthToDistanceMm(const DistanceSensorState& sensor, unsigned long pulseWidthUs) {
+  if (sensor.kind == DISTANCE_SENSOR_URM37) {
+    unsigned long centimeters = (pulseWidthUs + 25UL) / 50UL;
+    return static_cast<long>(centimeters * 10UL);
+  }
+  return static_cast<long>((pulseWidthUs * 343UL) / 2000UL);
+}
+
+const char* sensorKindName(const DistanceSensorState& sensor) {
+  switch (sensor.kind) {
+    case DISTANCE_SENSOR_HC_SR04:
+      return "hc_sr04";
+    case DISTANCE_SENSOR_URM37:
+      return "urm37";
+    case DISTANCE_SENSOR_DISABLED:
+    default:
+      return "disabled";
+  }
+}
+
+const char* urm37MeasureModeName(Urm37MeasureMode mode) {
+  return mode == URM37_MEASURE_AUTO ? "auto" : "pwm_passive";
+}
+
+void printNullablePin(uint8_t pin) {
+  if (isAssignedPin(pin)) {
+    Serial.print(pin);
+  } else {
+    Serial.print(F("null"));
+  }
+}
+
+void printNullableDistance(bool valid, long distanceMm) {
+  if (valid) {
+    Serial.print(distanceMm);
+  } else {
+    Serial.print(F("null"));
+  }
+}
+
+void resetSensorRuntimeState(DistanceSensorState& sensor, unsigned long nextTriggerAtMs) {
+  sensor.stage = SENSOR_IDLE;
+  sensor.valid = false;
+  sensor.lastDistanceMm = 0;
+  sensor.stageStartedUs = 0;
+  sensor.echoStartedUs = 0;
+  sensor.nextTriggerAtMs = nextTriggerAtMs;
+  sensor.lastSuccessAtMs = 0;
+}
+
+void configureSensorPins(DistanceSensorState& sensor) {
+  if (!sensorHasDistancePins(sensor)) {
+    return;
+  }
+
+  pinMode(sensor.echoPin, INPUT);
+
+  if (sensor.kind == DISTANCE_SENSOR_URM37 && sensor.urm37MeasureMode == URM37_MEASURE_AUTO) {
+    pinMode(sensor.trigPin, INPUT);
+    return;
+  }
+
+  pinMode(sensor.trigPin, OUTPUT);
+  digitalWrite(sensor.trigPin, sensorTriggerActiveLevel(sensor) ? LOW : HIGH);
+}
+
+void sanitizeSensorConfiguration() {
+  for (uint8_t index = 0; index < Config::DISTANCE_SENSOR_COUNT; ++index) {
+    DistanceSensorState& sensor = gSensors[index];
+
+    if (!sensor.enabled || sensor.kind == DISTANCE_SENSOR_DISABLED) {
+      disableSensorSlot(sensor);
+      continue;
+    }
+
+    if (!isAssignedPin(sensor.trigPin) || !isAssignedPin(sensor.echoPin) || sensor.trigPin == sensor.echoPin ||
+        isReservedSerialPin(sensor.trigPin) || isReservedSerialPin(sensor.echoPin) || isBaseHardwarePin(sensor.trigPin) ||
+        isBaseHardwarePin(sensor.echoPin)) {
+      disableSensorSlot(sensor);
+      continue;
+    }
+
+    bool duplicateDistancePin = false;
+    for (uint8_t previousIndex = 0; previousIndex < index; ++previousIndex) {
+      if (sensorUsesConfiguredPin(gSensors[previousIndex], sensor.trigPin) ||
+          sensorUsesConfiguredPin(gSensors[previousIndex], sensor.echoPin)) {
+        duplicateDistancePin = true;
+        break;
+      }
+    }
+    if (duplicateDistancePin) {
+      disableSensorSlot(sensor);
+      continue;
+    }
+
+    if (!sensorIsUrm37(sensor) || isAssignedPin(sensor.serialRxPin) != isAssignedPin(sensor.serialTxPin)) {
+      clearSensorSerialPins(sensor);
+    }
+
+    if (sensorHasSerialPins(sensor)) {
+      bool invalidSerialPins = sensor.serialRxPin == sensor.serialTxPin || sensor.serialRxPin == sensor.trigPin ||
+                               sensor.serialRxPin == sensor.echoPin || sensor.serialTxPin == sensor.trigPin ||
+                               sensor.serialTxPin == sensor.echoPin || isReservedSerialPin(sensor.serialRxPin) ||
+                               isReservedSerialPin(sensor.serialTxPin) || isBaseHardwarePin(sensor.serialRxPin) ||
+                               isBaseHardwarePin(sensor.serialTxPin);
+
+      if (!invalidSerialPins) {
+        for (uint8_t previousIndex = 0; previousIndex < index; ++previousIndex) {
+          if (sensorUsesConfiguredPin(gSensors[previousIndex], sensor.serialRxPin) ||
+              sensorUsesConfiguredPin(gSensors[previousIndex], sensor.serialTxPin)) {
+            invalidSerialPins = true;
+            break;
+          }
+        }
+      }
+
+      if (invalidSerialPins) {
+        clearSensorSerialPins(sensor);
+      }
+    }
+  }
+}
+
+uint8_t urm37Checksum(uint8_t command, uint8_t data0, uint8_t data1) {
+  return static_cast<uint8_t>(command + data0 + data1);
+}
+
+bool readUrm37Response(SoftwareSerial& urm37Serial, uint8_t response[4]) {
+  unsigned long deadlineAtMs = millis() + Config::URM37_SERIAL_TIMEOUT_MS;
+  uint8_t responseIndex = 0;
+  while (responseIndex < 4) {
+    if (urm37Serial.available() > 0) {
+      response[responseIndex++] = static_cast<uint8_t>(urm37Serial.read());
+      continue;
+    }
+    if (hasElapsed(millis(), deadlineAtMs)) {
+      return false;
+    }
+  }
+  return response[3] == urm37Checksum(response[0], response[1], response[2]);
+}
+
+bool runUrm37Command(const DistanceSensorState& sensor, uint8_t command, uint8_t data0, uint8_t data1, uint8_t response[4]) {
+  if (!sensorHasSerialPins(sensor)) {
+    return false;
+  }
+
+  SoftwareSerial urm37Serial(sensor.serialRxPin, sensor.serialTxPin);
+  urm37Serial.begin(Config::URM37_SERIAL_BAUD);
+  urm37Serial.listen();
+  while (urm37Serial.available() > 0) {
+    urm37Serial.read();
+  }
+
+  uint8_t request[4] = {command, data0, data1, urm37Checksum(command, data0, data1)};
+  size_t written = urm37Serial.write(request, sizeof(request));
+  urm37Serial.flush();
+  if (written != sizeof(request)) {
+    urm37Serial.end();
+    return false;
+  }
+
+  bool ok = readUrm37Response(urm37Serial, response);
+  urm37Serial.end();
+  return ok;
+}
+
+bool readUrm37EepromByte(const DistanceSensorState& sensor, uint8_t address, uint8_t& value) {
+  uint8_t response[4];
+  if (!runUrm37Command(sensor, 0x33, address, 0x00, response)) {
+    return false;
+  }
+  if (response[0] != 0x33 || response[1] != address) {
+    return false;
+  }
+  value = response[2];
+  return true;
+}
+
+bool writeUrm37EepromByte(const DistanceSensorState& sensor, uint8_t address, uint8_t value) {
+  uint8_t response[4];
+  if (!runUrm37Command(sensor, 0x44, address, value, response)) {
+    return false;
+  }
+  return response[0] == 0x44 && response[1] == address && response[2] == value;
+}
+
+bool refreshUrm37SettingsFromSensor(DistanceSensorState& sensor) {
+  if (!sensorHasSerialPins(sensor)) {
+    return false;
+  }
+
+  uint8_t compareLow = 0;
+  uint8_t compareHigh = 0;
+  uint8_t measureModeByte = 0;
+  uint8_t autoIntervalMs = 0;
+  if (!readUrm37EepromByte(sensor, 0x00, compareLow) || !readUrm37EepromByte(sensor, 0x01, compareHigh) ||
+      !readUrm37EepromByte(sensor, 0x02, measureModeByte) || !readUrm37EepromByte(sensor, 0x04, autoIntervalMs)) {
+    return false;
+  }
+
+  sensor.urm37CompareDistanceCm = static_cast<uint16_t>((static_cast<uint16_t>(compareHigh) << 8) | compareLow);
+  if (sensor.urm37CompareDistanceCm > 1000U) {
+    sensor.urm37CompareDistanceCm = 1000U;
+  }
+  sensor.urm37MeasureMode = measureModeByte == 0xAA ? URM37_MEASURE_AUTO : URM37_MEASURE_PWM_PASSIVE;
+  if (autoIntervalMs < Config::URM37_DEFAULT_AUTO_INTERVAL_MS) {
+    sensor.urm37AutoIntervalMs = Config::URM37_DEFAULT_AUTO_INTERVAL_MS;
+  } else {
+    sensor.urm37AutoIntervalMs = autoIntervalMs;
+  }
+  configureSensorPins(sensor);
+  return true;
+}
+
+bool readUrm37TemperatureC(const DistanceSensorState& sensor, float& temperatureC) {
+  uint8_t response[4];
+  if (!runUrm37Command(sensor, 0x11, 0x00, 0x00, response)) {
+    return false;
+  }
+  if (response[0] != 0x11) {
+    return false;
+  }
+  if (response[1] == 0xFF && response[2] == 0xFF) {
+    return false;
+  }
+
+  uint16_t magnitude = static_cast<uint16_t>(((response[1] & 0x0F) << 8) | response[2]);
+  temperatureC = static_cast<float>(magnitude) / 10.0f;
+  if ((response[1] & 0xF0) == 0xF0) {
+    temperatureC = -temperatureC;
+  }
+  return true;
+}
+
+void sendUrm37SettingsResponse(long requestId, uint8_t sensorId, const DistanceSensorState& sensor) {
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.print(F(",\"ok\":true,\"data\":{\"sensor\":"));
+  Serial.print(sensorId);
+  Serial.print(F(",\"measure_mode\":\""));
+  Serial.print(urm37MeasureModeName(sensor.urm37MeasureMode));
+  Serial.print(F("\",\"auto_measure_interval_ms\":"));
+  Serial.print(sensor.urm37AutoIntervalMs);
+  Serial.print(F(",\"compare_distance_cm\":"));
+  Serial.print(sensor.urm37CompareDistanceCm);
+  Serial.print(F(",\"sensitivity\":"));
+  Serial.print(sensor.urm37Sensitivity);
+  Serial.println(F("}}"));
 }
 
 /*
@@ -644,9 +1103,13 @@ void updateStepper() {
 
 // Стартуем очередное измерение ультразвуковым датчиком.
 void beginSensorCycle(DistanceSensorState& sensor) {
-  digitalWrite(sensor.trigPin, HIGH);
-  sensor.stage = SENSOR_TRIGGER_HIGH;
   sensor.stageStartedUs = micros();
+  if (sensor.kind == DISTANCE_SENSOR_URM37 && sensor.urm37MeasureMode == URM37_MEASURE_AUTO) {
+    sensor.stage = SENSOR_WAIT_ECHO_ACTIVE;
+    return;
+  }
+  digitalWrite(sensor.trigPin, sensorTriggerActiveLevel(sensor) ? HIGH : LOW);
+  sensor.stage = SENSOR_TRIGGER_ACTIVE;
 }
 
 // Завершаем цикл измерения и сохраняем результат только если он валиден.
@@ -670,32 +1133,33 @@ bool finishSensorCycle(DistanceSensorState& sensor, bool validMeasurement, long 
  */
 bool updateActiveSensor(DistanceSensorState& sensor) {
   unsigned long nowUs = micros();
+  bool echoActiveLevel = sensorEchoActiveLevel(sensor);
 
   switch (sensor.stage) {
-    case SENSOR_TRIGGER_HIGH:
-      if (hasElapsed(nowUs, sensor.stageStartedUs + Config::SENSOR_TRIGGER_PULSE_US)) {
-        digitalWrite(sensor.trigPin, LOW);
-        sensor.stage = SENSOR_WAIT_ECHO_HIGH;
+    case SENSOR_TRIGGER_ACTIVE:
+      if (hasElapsed(nowUs, sensor.stageStartedUs + sensorTriggerPulseUs(sensor))) {
+        digitalWrite(sensor.trigPin, sensorTriggerActiveLevel(sensor) ? LOW : HIGH);
+        sensor.stage = SENSOR_WAIT_ECHO_ACTIVE;
         sensor.stageStartedUs = nowUs;
       }
       break;
 
-    case SENSOR_WAIT_ECHO_HIGH:
-      if (digitalRead(sensor.echoPin) == HIGH) {
+    case SENSOR_WAIT_ECHO_ACTIVE:
+      if (digitalRead(sensor.echoPin) == (echoActiveLevel ? HIGH : LOW)) {
         sensor.echoStartedUs = nowUs;
-        sensor.stage = SENSOR_WAIT_ECHO_LOW;
-      } else if (hasElapsed(nowUs, sensor.stageStartedUs + Config::SENSOR_ECHO_TIMEOUT_US)) {
+        sensor.stage = SENSOR_WAIT_ECHO_INACTIVE;
+      } else if (hasElapsed(nowUs, sensor.stageStartedUs + sensorEchoWaitTimeoutUs(sensor))) {
         return finishSensorCycle(sensor, false, 0);
       }
       break;
 
-    case SENSOR_WAIT_ECHO_LOW:
-      if (digitalRead(sensor.echoPin) == LOW) {
+    case SENSOR_WAIT_ECHO_INACTIVE:
+      if (digitalRead(sensor.echoPin) != (echoActiveLevel ? HIGH : LOW)) {
         unsigned long pulseWidthUs = nowUs - sensor.echoStartedUs;
-        long distanceMm = static_cast<long>((pulseWidthUs * 343UL) / 2000UL);
+        long distanceMm = pulseWidthToDistanceMm(sensor, pulseWidthUs);
         return finishSensorCycle(sensor, true, distanceMm);
       }
-      if (hasElapsed(nowUs, sensor.echoStartedUs + Config::SENSOR_ECHO_TIMEOUT_US)) {
+      if (hasElapsed(nowUs, sensor.echoStartedUs + sensorEchoTimeoutUs(sensor))) {
         return finishSensorCycle(sensor, false, 0);
       }
       break;
@@ -722,11 +1186,11 @@ void updateSensors() {
   }
 
   unsigned long nowMs = millis();
-  for (uint8_t attempt = 0; attempt < 2; ++attempt) {
-    int candidate = (gNextSensorIndex + attempt) % 2;
-    if (hasElapsed(nowMs, gSensors[candidate].nextTriggerAtMs)) {
+  for (uint8_t attempt = 0; attempt < Config::DISTANCE_SENSOR_COUNT; ++attempt) {
+    int candidate = (gNextSensorIndex + attempt) % Config::DISTANCE_SENSOR_COUNT;
+    if (sensorHasDistancePins(gSensors[candidate]) && hasElapsed(nowMs, gSensors[candidate].nextTriggerAtMs)) {
       gActiveSensorIndex = candidate;
-      gNextSensorIndex = (candidate + 1) % 2;
+      gNextSensorIndex = (candidate + 1) % Config::DISTANCE_SENSOR_COUNT;
       beginSensorCycle(gSensors[candidate]);
       return;
     }
@@ -735,11 +1199,11 @@ void updateSensors() {
 
 // Возвращаем расстояние только если последнее измерение ещё не считается устаревшим.
 bool sensorDistanceAvailable(int sensorIndex, long& distanceMm) {
-  if (sensorIndex < 0 || sensorIndex >= 2) {
+  if (sensorIndex < 0 || sensorIndex >= Config::DISTANCE_SENSOR_COUNT) {
     return false;
   }
   DistanceSensorState& sensor = gSensors[sensorIndex];
-  if (!sensor.valid) {
+  if (!sensorHasDistancePins(sensor) || !sensor.valid) {
     return false;
   }
   if (!hasElapsed(millis(), sensor.lastSuccessAtMs + Config::SENSOR_STALE_MS)) {
@@ -749,13 +1213,61 @@ bool sensorDistanceAvailable(int sensorIndex, long& distanceMm) {
   return false;
 }
 
+bool extractSensorIndex(long requestId, const char* payload, int& sensorIndex) {
+  long sensorId = 0;
+  if (!extractLongField(payload, "sensor", sensorId) || sensorId < 1 ||
+      sensorId > static_cast<long>(Config::DISTANCE_SENSOR_COUNT)) {
+    sendErrorResponse(requestId, "bad_request", "sensor must be in range 1..4");
+    return false;
+  }
+  sensorIndex = static_cast<int>(sensorId) - 1;
+  return true;
+}
+
+bool ensureUrm37SerialCommandSupported(long requestId, const DistanceSensorState& sensor) {
+  if (!sensor.enabled || sensor.kind == DISTANCE_SENSOR_DISABLED || !sensorHasDistancePins(sensor)) {
+    sendErrorResponse(requestId, "not_configured", "distance sensor slot is disabled");
+    return false;
+  }
+  if (sensor.kind != DISTANCE_SENSOR_URM37) {
+    sendErrorResponse(requestId, "unsupported", "selected sensor is not URM37");
+    return false;
+  }
+  if (!sensorHasSerialPins(sensor)) {
+    sendErrorResponse(requestId, "not_configured", "URM37 serial pins are not configured");
+    return false;
+  }
+  return true;
+}
+
+void printDistanceSensorStatusEntry(uint8_t sensorIndex) {
+  const DistanceSensorState& sensor = gSensors[sensorIndex];
+  long distanceMm = 0;
+  bool distanceValid = sensorDistanceAvailable(sensorIndex, distanceMm);
+
+  Serial.print(F("\""));
+  Serial.print(sensorIndex + 1);
+  Serial.print(F("\":{\"enabled\":"));
+  printBool(sensor.enabled && sensor.kind != DISTANCE_SENSOR_DISABLED);
+  Serial.print(F(",\"kind\":\""));
+  Serial.print(sensorKindName(sensor));
+  Serial.print(F("\",\"pins\":{\"trigger\":"));
+  printNullablePin(sensor.trigPin);
+  Serial.print(F(",\"echo\":"));
+  printNullablePin(sensor.echoPin);
+  Serial.print(F(",\"serial_rx\":"));
+  printNullablePin(sensor.serialRxPin);
+  Serial.print(F(",\"serial_tx\":"));
+  printNullablePin(sensor.serialTxPin);
+  Serial.print(F("},\"serial_settings_available\":"));
+  printBool(sensorHasSerialPins(sensor));
+  Serial.print(F(",\"distance_mm\":"));
+  printNullableDistance(distanceValid, distanceMm);
+  Serial.print(F("}"));
+}
+
 // Сводный статус нужен для быстрой диагностики без отдельного вызова каждого датчика.
 void sendStatusResponse(long requestId) {
-  long distance1 = 0;
-  long distance2 = 0;
-  bool sensor1Valid = sensorDistanceAvailable(0, distance1);
-  bool sensor2Valid = sensorDistanceAvailable(1, distance2);
-
   Serial.print(F("{\"id\":"));
   Serial.print(requestId);
   Serial.print(F(",\"ok\":true,\"data\":{"));
@@ -777,17 +1289,24 @@ void sendStatusResponse(long requestId) {
   printBool(Config::RELAY_ENABLED);
   Serial.print(F(",\"stepper\":"));
   printBool(Config::STEPPER_ENABLED);
-  Serial.print(F("},\"distance_mm\":{\"1\":"));
-  if (sensor1Valid) {
-    Serial.print(distance1);
-  } else {
-    Serial.print(F("null"));
+  Serial.print(F("},\"distance_mm\":{"));
+  for (uint8_t sensorIndex = 0; sensorIndex < Config::DISTANCE_SENSOR_COUNT; ++sensorIndex) {
+    long distanceMm = 0;
+    bool distanceValid = sensorDistanceAvailable(sensorIndex, distanceMm);
+    if (sensorIndex > 0) {
+      Serial.print(F(","));
+    }
+    Serial.print(F("\""));
+    Serial.print(sensorIndex + 1);
+    Serial.print(F("\":"));
+    printNullableDistance(distanceValid, distanceMm);
   }
-  Serial.print(F(",\"2\":"));
-  if (sensor2Valid) {
-    Serial.print(distance2);
-  } else {
-    Serial.print(F("null"));
+  Serial.print(F("},\"distance_sensors\":{"));
+  for (uint8_t sensorIndex = 0; sensorIndex < Config::DISTANCE_SENSOR_COUNT; ++sensorIndex) {
+    if (sensorIndex > 0) {
+      Serial.print(F(","));
+    }
+    printDistanceSensorStatusEntry(sensorIndex);
   }
   Serial.println(F("}}}"));
 }
@@ -802,20 +1321,25 @@ void markCommandReceived() {
 void handlePing(long requestId) {
   Serial.print(F("{\"id\":"));
   Serial.print(requestId);
-  Serial.println(F(",\"ok\":true,\"data\":{\"pong\":true,\"firmware\":\"rescue_maze_low_level_v1\"}}"));
+  Serial.println(F(",\"ok\":true,\"data\":{\"pong\":true,\"firmware\":\"rescue_maze_low_level_v2\"}}"));
 }
 
 // Отдаём только одно конкретное расстояние, чтобы транспортный протокол был простым.
 void handleDistanceRequest(long requestId, const char* payload) {
-  long sensorId = 0;
-  if (!extractLongField(payload, "sensor", sensorId) || sensorId < 1 || sensorId > 2) {
-    sendErrorResponse(requestId, "bad_request", "sensor должен быть равен 1 или 2");
+  int sensorIndex = 0;
+  if (!extractSensorIndex(requestId, payload, sensorIndex)) {
+    return;
+  }
+  uint8_t sensorId = static_cast<uint8_t>(sensorIndex + 1);
+  DistanceSensorState& sensor = gSensors[sensorIndex];
+  if (!sensor.enabled || sensor.kind == DISTANCE_SENSOR_DISABLED || !sensorHasDistancePins(sensor)) {
+    sendErrorResponse(requestId, "not_configured", "distance sensor slot is disabled");
     return;
   }
 
   long distanceMm = 0;
-  if (!sensorDistanceAvailable(static_cast<int>(sensorId) - 1, distanceMm)) {
-    sendErrorResponse(requestId, "sensor_timeout", "измерение расстояния недоступно");
+  if (!sensorDistanceAvailable(sensorIndex, distanceMm)) {
+    sendErrorResponse(requestId, "sensor_timeout", "distance measurement is unavailable");
     return;
   }
 
@@ -826,6 +1350,154 @@ void handleDistanceRequest(long requestId, const char* payload) {
   Serial.print(F(",\"distance_mm\":"));
   Serial.print(distanceMm);
   Serial.println(F("}}"));
+}
+
+void handleUrm37TemperatureRequest(long requestId, const char* payload) {
+  int sensorIndex = 0;
+  if (!extractSensorIndex(requestId, payload, sensorIndex)) {
+    return;
+  }
+
+  DistanceSensorState& sensor = gSensors[sensorIndex];
+  if (!ensureUrm37SerialCommandSupported(requestId, sensor)) {
+    return;
+  }
+
+  float temperatureC = 0.0f;
+  if (!readUrm37TemperatureC(sensor, temperatureC)) {
+    sendErrorResponse(requestId, "sensor_timeout", "URM37 temperature is unavailable");
+    return;
+  }
+
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.print(F(",\"ok\":true,\"data\":{\"sensor\":"));
+  Serial.print(sensorIndex + 1);
+  Serial.print(F(",\"temperature_c\":"));
+  Serial.print(temperatureC, 1);
+  Serial.println(F("}}"));
+}
+
+void handleUrm37SettingsRequest(long requestId, const char* payload) {
+  int sensorIndex = 0;
+  if (!extractSensorIndex(requestId, payload, sensorIndex)) {
+    return;
+  }
+
+  DistanceSensorState& sensor = gSensors[sensorIndex];
+  if (!ensureUrm37SerialCommandSupported(requestId, sensor)) {
+    return;
+  }
+
+  if (!refreshUrm37SettingsFromSensor(sensor)) {
+    sendErrorResponse(requestId, "sensor_timeout", "URM37 settings are unavailable");
+    return;
+  }
+
+  sendUrm37SettingsResponse(requestId, static_cast<uint8_t>(sensorIndex + 1), sensor);
+}
+
+void handleUrm37SettingsUpdateRequest(long requestId, const char* payload) {
+  int sensorIndex = 0;
+  if (!extractSensorIndex(requestId, payload, sensorIndex)) {
+    return;
+  }
+
+  DistanceSensorState& sensor = gSensors[sensorIndex];
+  if (!ensureUrm37SerialCommandSupported(requestId, sensor)) {
+    return;
+  }
+
+  bool hasAnyUpdate = false;
+
+  char measureModeText[20];
+  bool hasMeasureMode = extractStringField(payload, "measure_mode", measureModeText, sizeof(measureModeText));
+  Urm37MeasureMode nextMeasureMode = sensor.urm37MeasureMode;
+  if (hasMeasureMode) {
+    hasAnyUpdate = true;
+    if (strcmp(measureModeText, "pwm_passive") == 0) {
+      nextMeasureMode = URM37_MEASURE_PWM_PASSIVE;
+    } else if (strcmp(measureModeText, "auto") == 0) {
+      nextMeasureMode = URM37_MEASURE_AUTO;
+    } else {
+      sendErrorResponse(requestId, "bad_request", "measure_mode must be pwm_passive or auto");
+      return;
+    }
+  }
+
+  long autoMeasureIntervalMs = 0;
+  bool hasAutoMeasureInterval = extractLongField(payload, "auto_measure_interval_ms", autoMeasureIntervalMs);
+  if (hasAutoMeasureInterval) {
+    hasAnyUpdate = true;
+    if (autoMeasureIntervalMs < 25 || autoMeasureIntervalMs > 255) {
+      sendErrorResponse(requestId, "bad_request", "auto_measure_interval_ms must be in range 25..255");
+      return;
+    }
+  }
+
+  long compareDistanceCm = 0;
+  bool hasCompareDistance = extractLongField(payload, "compare_distance_cm", compareDistanceCm);
+  if (hasCompareDistance) {
+    hasAnyUpdate = true;
+    if (compareDistanceCm < 0 || compareDistanceCm > 1000) {
+      sendErrorResponse(requestId, "bad_request", "compare_distance_cm must be in range 0..1000");
+      return;
+    }
+  }
+
+  long sensitivity = 0;
+  bool hasSensitivity = extractLongField(payload, "sensitivity", sensitivity);
+  if (hasSensitivity) {
+    hasAnyUpdate = true;
+    if (sensitivity < 10 || sensitivity > 200) {
+      sendErrorResponse(requestId, "bad_request", "sensitivity must be in range 10..200");
+      return;
+    }
+  }
+
+  if (!hasAnyUpdate) {
+    sendErrorResponse(requestId, "bad_request", "at least one URM37 setting must be provided");
+    return;
+  }
+
+  if (hasCompareDistance) {
+    uint16_t boundedCompareDistance = static_cast<uint16_t>(compareDistanceCm);
+    if (!writeUrm37EepromByte(sensor, 0x00, static_cast<uint8_t>(boundedCompareDistance & 0xFFU)) ||
+        !writeUrm37EepromByte(sensor, 0x01, static_cast<uint8_t>((boundedCompareDistance >> 8) & 0xFFU))) {
+      sendErrorResponse(requestId, "sensor_timeout", "failed to write URM37 compare distance");
+      return;
+    }
+    sensor.urm37CompareDistanceCm = boundedCompareDistance;
+  }
+
+  if (hasMeasureMode) {
+    uint8_t modeByte = nextMeasureMode == URM37_MEASURE_AUTO ? 0xAA : 0xBB;
+    if (!writeUrm37EepromByte(sensor, 0x02, modeByte)) {
+      sendErrorResponse(requestId, "sensor_timeout", "failed to write URM37 measure mode");
+      return;
+    }
+    sensor.urm37MeasureMode = nextMeasureMode;
+  }
+
+  if (hasAutoMeasureInterval) {
+    if (!writeUrm37EepromByte(sensor, 0x04, static_cast<uint8_t>(autoMeasureIntervalMs))) {
+      sendErrorResponse(requestId, "sensor_timeout", "failed to write URM37 auto interval");
+      return;
+    }
+    sensor.urm37AutoIntervalMs = static_cast<uint8_t>(autoMeasureIntervalMs);
+  }
+
+  if (hasSensitivity) {
+    sensor.urm37Sensitivity = static_cast<uint8_t>(sensitivity);
+  }
+
+  if (gActiveSensorIndex == sensorIndex) {
+    gActiveSensorIndex = -1;
+  }
+  resetSensorRuntimeState(sensor, millis() + Config::SENSOR_SAMPLE_INTERVAL_MS);
+  configureSensorPins(sensor);
+
+  sendUrm37SettingsResponse(requestId, static_cast<uint8_t>(sensorIndex + 1), sensor);
 }
 
 // Состояние кнопки читается мгновенно и не требует отдельного автомата.
@@ -1072,6 +1744,21 @@ void handleRequest(const char* payload) {
     return;
   }
 
+  if (strcmp(operation, "get_urm37_temperature") == 0) {
+    handleUrm37TemperatureRequest(requestId, payload);
+    return;
+  }
+
+  if (strcmp(operation, "get_urm37_settings") == 0) {
+    handleUrm37SettingsRequest(requestId, payload);
+    return;
+  }
+
+  if (strcmp(operation, "set_urm37_settings") == 0) {
+    handleUrm37SettingsUpdateRequest(requestId, payload);
+    return;
+  }
+
   if (strcmp(operation, "get_button") == 0) {
     handleButtonRequest(requestId);
     return;
@@ -1182,12 +1869,20 @@ void setupPins() {
   analogWrite(leftMotorPins().pwmPin, 0);
   analogWrite(rightMotorPins().pwmPin, 0);
 
-  for (uint8_t index = 0; index < 2; ++index) {
-    pinMode(gSensors[index].trigPin, OUTPUT);
-    pinMode(gSensors[index].echoPin, INPUT);
-    digitalWrite(gSensors[index].trigPin, LOW);
-    gSensors[index].stage = SENSOR_IDLE;
-    gSensors[index].nextTriggerAtMs = millis() + (index * Config::SENSOR_SAMPLE_INTERVAL_MS);
+  sanitizeSensorConfiguration();
+
+  unsigned long nowMs = millis();
+  for (uint8_t index = 0; index < Config::DISTANCE_SENSOR_COUNT; ++index) {
+    DistanceSensorState& sensor = gSensors[index];
+    resetSensorRuntimeState(sensor, nowMs + (index * Config::SENSOR_SAMPLE_INTERVAL_MS));
+    if (!sensorHasDistancePins(sensor)) {
+      continue;
+    }
+    configureSensorPins(sensor);
+    if (sensorHasSerialPins(sensor)) {
+      refreshUrm37SettingsFromSensor(sensor);
+      resetSensorRuntimeState(sensor, nowMs + (index * Config::SENSOR_SAMPLE_INTERVAL_MS));
+    }
   }
 
   pinMode(Config::BUTTON_PIN, INPUT_PULLUP);

@@ -156,6 +156,93 @@ class ArduinoServiceTests(unittest.TestCase):
         self.assertAlmostEqual(service.distance_sensor.get(1, unit="m"), 0.345)
         service.close()
 
+    def test_status_returns_extended_distance_sensor_metadata(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"distance_sensors":{"1":{"enabled":true,"kind":"hc_sr04","pins":{"trigger":2,"echo":3,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":345},"2":{"enabled":true,"kind":"urm37","pins":{"trigger":8,"echo":9,"serial_rx":10,"serial_tx":11},"serial_settings_available":true,"distance_mm":680},"3":{"enabled":false,"kind":"disabled","pins":{"trigger":null,"echo":null,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":null},"4":{"enabled":false,"kind":"disabled","pins":{"trigger":null,"echo":null,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":null}}}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.status.sensors"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        payload = service.status()
+        self.assertIn("distance_sensors", payload)
+        self.assertEqual(payload["distance_sensors"]["2"]["kind"], "urm37")
+        self.assertTrue(payload["distance_sensors"]["2"]["serial_settings_available"])
+        service.close()
+
+    def test_distance_sensor_info_reads_extended_status(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"distance_sensors":{"1":{"enabled":true,"kind":"hc_sr04","pins":{"trigger":2,"echo":3,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":340},"2":{"enabled":true,"kind":"urm37","pins":{"trigger":8,"echo":9,"serial_rx":10,"serial_tx":11},"serial_settings_available":true,"distance_mm":680},"3":{"enabled":false,"kind":"disabled","pins":{"trigger":null,"echo":null,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":null},"4":{"enabled":false,"kind":"disabled","pins":{"trigger":null,"echo":null,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":null}}}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.sensor.info"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        info = service.distance_sensor.info(2)
+        self.assertEqual(info.sensor_id, 2)
+        self.assertEqual(info.kind, "urm37")
+        self.assertEqual(info.trigger_pin, 8)
+        self.assertEqual(info.serial_rx_pin, 10)
+        self.assertTrue(info.serial_settings_available)
+        self.assertAlmostEqual(info.distance_mm or 0.0, 680.0)
+        service.close()
+
+    def test_urm37_temperature_and_settings_api(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"temperature_c":23.75}}\n',
+                '{"id":3,"ok":true,"data":{"measure_mode":"auto","auto_measure_interval_ms":70,"compare_distance_cm":150,"sensitivity":120}}\n',
+                '{"id":4,"ok":true,"data":{"measure_mode":"pwm_passive","auto_measure_interval_ms":55,"compare_distance_cm":90,"sensitivity":110}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.urm37.api"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        self.assertAlmostEqual(service.distance_sensor.get_temperature(2), 23.75)
+        settings = service.distance_sensor.get_urm37_settings(2)
+        self.assertEqual(settings.measure_mode, "auto")
+        self.assertEqual(settings.auto_measure_interval_ms, 70)
+
+        updated_settings = service.distance_sensor.configure_urm37(
+            2,
+            measure_mode="pwm_passive",
+            auto_measure_interval_ms=55,
+            compare_distance_cm=90,
+            sensitivity=110,
+        )
+        self.assertEqual(updated_settings.measure_mode, "pwm_passive")
+
+        payload = json.loads(connection.writes[3])
+        self.assertEqual(payload["op"], "set_urm37_settings")
+        self.assertEqual(payload["args"]["sensor"], 2)
+        self.assertEqual(payload["args"]["auto_measure_interval_ms"], 55)
+        self.assertEqual(payload["args"]["compare_distance_cm"], 90)
+        self.assertEqual(payload["args"]["sensitivity"], 110)
+        service.close()
+
     @patch("raspberry.arduino_service.time.sleep", return_value=None)
     def test_timed_pwm_builder_sends_single_atomic_command(self, sleep_mock) -> None:
         connection = FakeSerial(
@@ -568,12 +655,12 @@ class ArduinoServiceTests(unittest.TestCase):
         service.start_activity_session(output_dir=session_dir, include_map=False)
 
         with self.assertRaises(ValueError):
-            service.distance_sensor.get(3)
+            service.distance_sensor.get(5)
 
         summary = service.stop_activity_session()
         self.assertIsNone(summary["route_path"])
         actions_text = (session_dir / "actions.txt").read_text(encoding="utf-8")
-        self.assertIn("Не удалось получить расстояние с датчика 3", actions_text)
+        self.assertIn("Не удалось получить расстояние с датчика 5", actions_text)
         self.assertIn("| ERROR |", actions_text)
 
         events = json.loads((session_dir / "events.json").read_text(encoding="utf-8"))

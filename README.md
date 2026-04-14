@@ -50,7 +50,9 @@
 Прошивка реализует:
 
 - управление двумя моторами через Motor Shield;
-- чтение двух ультразвуковых датчиков без блокировки `loop()`;
+- чтение до четырёх конфигурируемых ультразвуковых слотов без блокировки `loop()`;
+- выбор типа датчика в каждом слоте: `HC-SR04` или `URM37`;
+- чтение температуры и безопасных настроек `URM37` через отдельные `TX/RX`, если они заведены в конфиге прошивки;
 - чтение кнопки;
 - watchdog по времени отсутствия команд;
 - timed-команды для моторов;
@@ -203,6 +205,9 @@ Python-слой разделён на два сервиса:
 - `ping`
 - `get_status`
 - `get_distance`
+- `get_urm37_temperature`
+- `get_urm37_settings`
+- `set_urm37_settings`
 - `get_button`
 - `set_motor`
 - `stop_all`
@@ -210,6 +215,13 @@ Python-слой разделён на два сервиса:
 - `set_relay`
 - `stepper_move`
 - `stepper_stop`
+
+Что важно по ультразвуку:
+
+- `get_distance` теперь принимает `sensor` от `1` до `4`;
+- `get_status` сохраняет совместимое поле `distance_mm`, но теперь отдаёт его для слотов `1..4` и дополнительно включает подробный блок `distance_sensors`;
+- `distance_sensors` содержит `enabled`, `kind`, `pins`, `serial_settings_available` и последнее `distance_mm` для каждого слота;
+- URM37-специфичные команды возвращают `unsupported`, если выбран не `URM37`, и `not_configured`, если у URM37 не заданы оба `serial_rx`/`serial_tx`.
 
 ## Публичный Python API
 
@@ -224,8 +236,15 @@ with ArduinoService() as arduino:
     print(arduino.ping())
     print(arduino.status())
     print(arduino.distance_sensor.get(1, unit="cm"))
+    print(arduino.distance_sensor.info(2))
     print(arduino.button_status())
     print(arduino.align_parallel_to_wall(wall_side="right", tolerance_mm=8.0))
+
+    # Во втором слоте по умолчанию уже стоит URM37 с PWM-пинами D8/D9 и
+    # опциональным serial для температуры/настроек на A2/A3.
+    print(arduino.distance_sensor.get_temperature(2))
+    print(arduino.distance_sensor.get_urm37_settings(2))
+    print(arduino.distance_sensor.configure_urm37(2, measure_mode="auto", auto_measure_interval_ms=70))
 
     arduino.eng_all.pwm(40).time(1.5)
     arduino.eng_r.ramp(start_pwm=10, stop_pwm=100, ramp_seconds=0.5).time(3)
@@ -241,6 +260,10 @@ with ArduinoService() as arduino:
 Основные фасады:
 
 - `distance_sensor.get(sensor_id, unit="mm")`
+- `distance_sensor.info(sensor_id)`
+- `distance_sensor.get_temperature(sensor_id)`
+- `distance_sensor.get_urm37_settings(sensor_id)`
+- `distance_sensor.configure_urm37(sensor_id, ...)`
 - `button_status()`
 - `align_parallel_to_wall(front_sensor_id=1, rear_sensor_id=2, wall_side="right", ...)`
 - `eng_all.pwm(percent).time(seconds)`
@@ -366,7 +389,7 @@ if arduino.button_status():
 
 Параметры:
 
-- `sensor_id` — номер датчика, только `1` или `2`.
+- `sensor_id` — номер слота датчика, от `1` до `4`.
 - `unit` — единица измерения: `"mm"`, `"cm"` или `"m"`.
 
 Что возвращает:
@@ -385,6 +408,63 @@ distance_cm = arduino.distance_sensor.get(2, unit="cm")
 - для навигации вдоль стены;
 - для проверки препятствия;
 - как базовое измерение перед принятием решения.
+
+Важно:
+
+- по умолчанию прошивка включает только слоты `1` и `2`; слоты `3` и `4` выключены и не имеют назначенных пинов;
+- слот `1` по умолчанию настроен как `HC-SR04`, а слот `2` — как `URM37`;
+- `HC-SR04` и `URM37` читаются через один и тот же `distance_sensor.get(...)`, различие скрыто внутри прошивки;
+- для отключённого слота прошивка возвращает `not_configured`, а для слишком старого измерения — `sensor_timeout`.
+
+#### `distance_sensor.info(sensor_id)`
+
+Назначение:
+
+- возвращает метаданные по слоту датчика без ручного разбора `status()`;
+- показывает тип датчика, включён ли слот, какие пины назначены и доступен ли serial-доступ к настройкам `URM37`.
+
+Что возвращает:
+
+- `DistanceSensorInfo(sensor_id, enabled, kind, trigger_pin, echo_pin, serial_rx_pin, serial_tx_pin, serial_settings_available, distance_mm)`.
+
+#### `distance_sensor.get_temperature(sensor_id)`
+
+Назначение:
+
+- читает температуру только у `URM37`;
+- требует, чтобы у выбранного слота были заданы оба serial-пина `serial_rx` и `serial_tx`.
+
+Что возвращает:
+
+- `float` в градусах Цельсия.
+
+#### `distance_sensor.get_urm37_settings(sensor_id)` и `distance_sensor.configure_urm37(sensor_id, ...)`
+
+Назначение:
+
+- читают и обновляют безопасный поднабор настроек `URM37`;
+- поверх serial-протокола датчика работают с `measure_mode`, `auto_measure_interval_ms`, `compare_distance_cm` и `sensitivity`.
+
+Поддерживаемые значения:
+
+- `measure_mode`: `"pwm_passive"` или `"auto"`;
+- `auto_measure_interval_ms`: от `25` до `255`;
+- `compare_distance_cm`: от `0` до `1000`;
+- `sensitivity`: от `10` до `200`.
+
+Важно:
+
+- переключение `TTL/RS232` намеренно не вынесено в API, чтобы не перевести модуль в несовместимый режим;
+- по официальной документации DFRobot минимальный автоинтервал в разных материалах указан по-разному: `25 ms` в старом guide и `70..255 ms` в reference, поэтому стек принимает `25..255`, но значения ниже `70 ms` стоит считать legacy-режимом;
+- DFRobot не публикует отдельный serial-регистр для `sensitivity`, поэтому это поле хранится на стороне прошивки как совместимый software-side параметр и не переключает внутренний TTL/RS232 режим модуля.
+
+Официальные материалы DFRobot по `URM37`:
+
+- [URM37 V5.0 product page](https://wiki.dfrobot.com/URM37_V5.0_Ultrasonic_Sensor_SKU_SEN0001_)
+- [PWM distance example](https://wiki.dfrobot.com/sen0001/docs/21980)
+- [Temperature serial example](https://wiki.dfrobot.com/sen0001/docs/21977)
+- [Reference and EEPROM commands](https://wiki.dfrobot.com/sen0001/docs/21975)
+- [Guide with TTL/RS232 warning](https://wiki.dfrobot.com/sen0001/docs/21984)
 
 #### `align_parallel_to_wall(...)`
 
@@ -442,6 +522,7 @@ else:
 
 - метод работает на стороне Raspberry Pi поверх уже существующих команд `get_distance`, `set_motor` и `stop_all`;
 - отдельная команда в прошивке Arduino для него не нужна;
+- можно использовать любые два разных слота `1..4`; значения по умолчанию остаются `front_sensor_id=1` и `rear_sensor_id=2`;
 - это приближённое выравнивание, зависящее от реальных датчиков, люфтов, покрытия и подобранных параметров импульса.
 
 #### Управление моторами: `eng_all`, `eng_l`, `eng_r`
@@ -777,7 +858,7 @@ logs/arduino_sessions/20260410_153015_test_run/
 2026-04-10T15:30:15 | OK | Проверка связи с Arduino на порту /dev/ttyACM0 выполнена — Удачно
 2026-04-10T15:30:16 | OK | Получено расстояние с датчика 1: 34.5 см — Удачно
 2026-04-10T15:30:18 | OK | Робот проехал вперёд на команде 40% в течение 1.50 с — Выполнено
-2026-04-10T15:30:20 | ERROR | Не удалось получить расстояние с датчика 3: sensor_id должен быть равен 1 или 2
+2026-04-10T15:30:20 | ERROR | Не удалось получить расстояние с датчика 5: sensor_id должен быть в диапазоне от 1 до 4
 ```
 
 Что туда попадает:
@@ -1201,14 +1282,26 @@ print(telemetry["power"]["power_good_now"])
 
 В прошивке сейчас заложена следующая базовая схема:
 
-- ультразвуковой датчик 1: `TRIG D2`, `ECHO D3`
+- слот расстояния `1`: `HC-SR04`, `TRIG D2`, `ECHO D3`
 - левый мотор: `DIR D4`, `PWM D5`
 - правый мотор: `PWM D6`, `DIR D7`
-- ультразвуковой датчик 2: `TRIG D8`, `ECHO D9`
+- слот расстояния `2`: `URM37`, `COMP/TRIG D8`, `PWM/ECHO D9`
 - сервопривод: `D10`
 - реле: `D11`
 - шаговый двигатель: `STEP D12`, `DIR D13`, `ENABLE A0`
 - кнопка: `A1`
+- слот `2` optional serial для `URM37`: `Arduino A2 = serial_rx = к TX датчика`, `Arduino A3 = serial_tx = к RX датчика`
+- слот расстояния `3`: выключен, пины не назначены
+- слот расстояния `4`: выключен, пины не назначены
+
+Что важно для `URM37`:
+
+- обязательные линии для расстояния: `COMP/TRIG` и `PWM/ECHO`;
+- опциональные линии: `TX/RX` нужны только для температуры и настроек;
+- по умолчанию для второго слота эти optional-линии заведены на `A2/A3`, но если температура и EEPROM-настройки не нужны, можно оставить подключёнными только `D8/D9`;
+- пины `0/1` зарезервированы под основной `Serial`, поэтому для `URM37` serial их использовать нельзя;
+- прошивка автоматически отключает слот или serial-настройки, если найдёт конфликтующие или дублирующиеся пины;
+- модуль нельзя переводить в `RS232`, если он подключён к TTL-входам Arduino.
 
 При необходимости это меняется в конфигурационном блоке в начале [arduino/arduino.ino](arduino/arduino.ino).
 
@@ -1226,7 +1319,9 @@ print(telemetry["power"]["power_good_now"])
 Что желательно проверить до первой реальной поездки:
 
 - кнопка корректно определяется через `button_status()`;
-- оба ультразвуковых датчика дают разумные значения;
+- активные ультразвуковые слоты дают разумные значения;
+- если используется `URM37`, температура и `get_urm37_settings()` отвечают только при заведённых `serial_rx/serial_tx`;
+- для дефолтного второго слота стоит отдельно проверить как PWM-дистанцию по `D8/D9`, так и optional serial по `A2/A3`, если он подключён;
 - каждый мотор по отдельности крутится в нужную сторону;
 - timed-команда сама завершает движение;
 - `stop_all()` действительно останавливает всё сразу.
@@ -1238,6 +1333,8 @@ print(telemetry["power"]["power_good_now"])
 - `SERIAL_BAUD` — должен совпадать с настройкой serial на Raspberry Pi;
 - `COMMAND_WATCHDOG_MS` — чем меньше значение, тем быстрее робот остановится при потере связи;
 - `SENSOR_SAMPLE_INTERVAL_MS` и `SENSOR_STALE_MS` — влияют на частоту и "свежесть" измерений;
+- конфигурация слотов расстояния — тип датчика (`HC-SR04` / `URM37`), `trigger/echo`, а для `URM37` при необходимости ещё и `serial_rx/serial_tx`;
+- если оставляете дефолтный второй слот как `URM37`, текущая рекомендуемая распиновка — `D8/D9` для PWM и `A2/A3` для optional serial;
 - `SWAP_TRACK_MOTORS` — полезно, если каналы Motor Shield перепутаны местами;
 - `LEFT_TRACK_INVERTED` и `RIGHT_TRACK_INVERTED` — если моторы едут "задом наперёд";
 - `SERVO_ENABLED`, `RELAY_ENABLED`, `STEPPER_ENABLED` — если часть модулей на роботе отсутствует.
@@ -1249,6 +1346,8 @@ print(telemetry["power"]["power_good_now"])
 - Raspberry Pi и Arduino используют разную скорость serial;
 - Raspberry Pi отправляет JSON без завершающего символа новой строки `\n`;
 - перепутаны `TRIG` и `ECHO` у ультразвукового датчика;
+- у `URM37` не заведены оба serial-пина, хотя вызываются `get_urm37_temperature()` или `get_urm37_settings()`;
+- модуль `URM37` случайно переведён в `RS232`, хотя подключён к TTL-уровням Arduino;
 - перепутаны `DIR` и `PWM` у одного из моторных каналов;
 - нет общей земли между Arduino, Motor Shield, датчиками и внешним питанием;
 - не хватает питания на моторы, серву или stepper driver;
@@ -1259,7 +1358,7 @@ print(telemetry["power"]["power_good_now"])
 1. Проверить `ping()`.
 2. Проверить `status()`.
 3. Проверить кнопку.
-4. Проверить оба датчика расстояния.
+4. Проверить все активные слоты расстояния.
 5. Проверить `eng_l` и `eng_r` по отдельности.
 6. Проверить `stop_all()`.
 7. Только после этого включать `servo`, `relay` и `stepper`.
@@ -1297,7 +1396,7 @@ pip install -r raspberry/requirements.txt
 python -m raspberry.main --port COM3
 ```
 
-Быстрая диагностика обоих датчиков с итоговой сводкой:
+Быстрая диагностика двух базовых слотов с итоговой сводкой:
 
 ```bash
 python -m raspberry.main --diagnose-sensors --samples 5 --interval 0.5
@@ -1307,6 +1406,12 @@ python -m raspberry.main --diagnose-sensors --samples 5 --interval 0.5
 
 ```bash
 python -m raspberry.main --diagnose-sensors --sensors 1 --samples 10 --interval 0.2
+```
+
+Проверка всех четырёх слотов сразу:
+
+```bash
+python -m raspberry.main --diagnose-sensors --sensors 1 2 3 4 --samples 5 --interval 0.5
 ```
 
 ## Тесты

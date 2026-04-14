@@ -92,5 +92,24 @@ class MainTests(unittest.TestCase):
         self.assertIn("Датчик 2: успешных чтений 3, ошибок 0", rendered)
 
 
+    def test_monitor_mode_accepts_fourth_sensor(self) -> None:
+        FakeArduinoService.scripted_results = {
+            4: [321.0],
+        }
+        output = io.StringIO()
+
+        with patch("raspberry.main.ArduinoService", FakeArduinoService):
+            exit_code = main_module.main(
+                ["--port", "COM7", "--iterations", "1", "--sensors", "4"],
+                output=output,
+                sleep_fn=lambda _: None,
+            )
+
+        rendered = output.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Датчик 4: 321.0 мм", rendered)
+        self.assertEqual(FakeArduinoService.created_ports, ["COM7"])
+
+
 if __name__ == "__main__":
     unittest.main()

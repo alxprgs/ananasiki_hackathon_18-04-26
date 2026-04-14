@@ -14,7 +14,7 @@ import logging
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from html import escape
 from itertools import count
@@ -37,6 +37,17 @@ UnitName = Literal["mm", "cm", "m"]
 MotorTarget = Literal["all", "left", "right"]
 WallSide = Literal["left", "right"]
 RotationDirection = Literal["left", "right"]
+DistanceSensorKind = Literal["disabled", "hc_sr04", "urm37"]
+Urm37MeasureMode = Literal["pwm_passive", "auto"]
+
+MIN_DISTANCE_SENSOR_ID = 1
+MAX_DISTANCE_SENSOR_ID = 4
+URM37_AUTO_INTERVAL_MIN_MS = 25
+URM37_AUTO_INTERVAL_MAX_MS = 255
+URM37_COMPARE_DISTANCE_MIN_CM = 0
+URM37_COMPARE_DISTANCE_MAX_CM = 1000
+URM37_SENSITIVITY_MIN = 10
+URM37_SENSITIVITY_MAX = 200
 
 
 class ArduinoServiceError(RuntimeError):
@@ -61,6 +72,47 @@ class UnsupportedHardwareError(ArduinoProtocolError):
 
 class SerialTimeoutError(ArduinoProtocolError):
     """Выбрасывается, когда Arduino не отвечает в пределах заданного таймаута."""
+
+
+def _validate_sensor_id(sensor_id: int, *, field_name: str = "sensor_id") -> int:
+    normalized_sensor_id = int(sensor_id)
+    if not MIN_DISTANCE_SENSOR_ID <= normalized_sensor_id <= MAX_DISTANCE_SENSOR_ID:
+        raise ValueError(f"{field_name} должен быть в диапазоне от 1 до 4")
+    return normalized_sensor_id
+
+
+def _validate_urm37_measure_mode(measure_mode: str) -> Urm37MeasureMode:
+    normalized_mode = str(measure_mode)
+    if normalized_mode not in ("pwm_passive", "auto"):
+        raise ValueError('measure_mode должен быть равен "pwm_passive" или "auto"')
+    return normalized_mode
+
+
+def _validate_urm37_auto_measure_interval_ms(value: int) -> int:
+    normalized_value = int(value)
+    if not URM37_AUTO_INTERVAL_MIN_MS <= normalized_value <= URM37_AUTO_INTERVAL_MAX_MS:
+        raise ValueError(
+            f"auto_measure_interval_ms должен быть в диапазоне от {URM37_AUTO_INTERVAL_MIN_MS} до {URM37_AUTO_INTERVAL_MAX_MS}"
+        )
+    return normalized_value
+
+
+def _validate_urm37_compare_distance_cm(value: int) -> int:
+    normalized_value = int(value)
+    if not URM37_COMPARE_DISTANCE_MIN_CM <= normalized_value <= URM37_COMPARE_DISTANCE_MAX_CM:
+        raise ValueError(
+            f"compare_distance_cm должен быть в диапазоне от {URM37_COMPARE_DISTANCE_MIN_CM} до {URM37_COMPARE_DISTANCE_MAX_CM}"
+        )
+    return normalized_value
+
+
+def _validate_urm37_sensitivity(value: int) -> int:
+    normalized_value = int(value)
+    if not URM37_SENSITIVITY_MIN <= normalized_value <= URM37_SENSITIVITY_MAX:
+        raise ValueError(
+            f"sensitivity должен быть в диапазоне от {URM37_SENSITIVITY_MIN} до {URM37_SENSITIVITY_MAX}"
+        )
+    return normalized_value
 
 
 def _default_serial_factory(**kwargs: Any) -> Any:
@@ -119,6 +171,32 @@ class MotionMapCalibration:
 
     max_linear_speed_mm_per_sec: float = 320.0
     max_turn_deg_per_sec: float = 180.0
+
+
+@dataclass(slots=True, frozen=True)
+class DistanceSensorInfo:
+    """РЎРІРѕРґРЅРѕРµ РѕРїРёСЃР°РЅРёРµ СЃР»РѕС‚Р° СѓР»СЊС‚СЂР°Р·РІСѓРєРѕРІРѕРіРѕ РґР°С‚С‡РёРєР°."""
+
+    sensor_id: int
+    enabled: bool
+    kind: DistanceSensorKind
+    trigger_pin: int | None
+    echo_pin: int | None
+    serial_rx_pin: int | None
+    serial_tx_pin: int | None
+    serial_settings_available: bool
+    distance_mm: float | None
+
+
+@dataclass(slots=True, frozen=True)
+class Urm37Settings:
+    """Р‘РµР·РѕРїР°СЃРЅРѕРµ РїСЂРµРґСЃС‚Р°РІР»РµРЅРёРµ РЅР°СЃС‚СЂРѕРµРє URM37 РІ Python API."""
+
+    sensor_id: int
+    measure_mode: Urm37MeasureMode
+    auto_measure_interval_ms: int
+    compare_distance_cm: int
+    sensitivity: int
 
 
 @dataclass(slots=True)
@@ -808,6 +886,187 @@ class ArduinoService:
             route_label="Шаговый стоп",
         )
 
+    def _get_distance_sensor_info(self, sensor_id: int) -> DistanceSensorInfo:
+        normalized_sensor_id = _validate_sensor_id(sensor_id)
+        return self._run_logged_action(
+            category="sensor",
+            action="distance_sensor.info",
+            params={"sensor_id": normalized_sensor_id},
+            protocol_op="get_status",
+            operation=lambda: self._read_distance_sensor_info(normalized_sensor_id),
+            success_text=lambda info: (
+                f"Получена конфигурация датчика {info.sensor_id}: kind={info.kind}, enabled={info.enabled} — Удачно"
+            ),
+            error_text=lambda exc: f"Не удалось получить конфигурацию датчика {normalized_sensor_id}: {exc}",
+            result_transform=lambda info: asdict(info),
+        )
+
+    def _read_distance_sensor_info(self, sensor_id: int) -> DistanceSensorInfo:
+        status_payload = self._send_request("get_status", idempotent=True, retries=self._retry_count)
+        return self._parse_distance_sensor_info(status_payload, sensor_id)
+
+    def _parse_distance_sensor_info(self, status_payload: dict[str, Any], sensor_id: int) -> DistanceSensorInfo:
+        normalized_sensor_id = _validate_sensor_id(sensor_id)
+        sensors = status_payload.get("distance_sensors")
+        if isinstance(sensors, dict):
+            raw_sensor = sensors.get(str(normalized_sensor_id), sensors.get(normalized_sensor_id))
+            if isinstance(raw_sensor, dict):
+                pins = raw_sensor.get("pins")
+                if not isinstance(pins, dict):
+                    pins = {}
+                enabled = bool(raw_sensor.get("enabled"))
+                raw_kind = str(raw_sensor.get("kind") or ("disabled" if not enabled else "hc_sr04"))
+                kind: DistanceSensorKind = raw_kind if raw_kind in ("disabled", "hc_sr04", "urm37") else "disabled"
+                raw_distance_mm = raw_sensor.get("distance_mm")
+                return DistanceSensorInfo(
+                    sensor_id=normalized_sensor_id,
+                    enabled=enabled,
+                    kind=kind,
+                    trigger_pin=self._coerce_optional_int(pins.get("trigger")),
+                    echo_pin=self._coerce_optional_int(pins.get("echo")),
+                    serial_rx_pin=self._coerce_optional_int(pins.get("serial_rx")),
+                    serial_tx_pin=self._coerce_optional_int(pins.get("serial_tx")),
+                    serial_settings_available=bool(raw_sensor.get("serial_settings_available")),
+                    distance_mm=None if raw_distance_mm is None else float(raw_distance_mm),
+                )
+
+        legacy_distance_map = status_payload.get("distance_mm")
+        if normalized_sensor_id in (1, 2):
+            raw_distance_mm = None
+            if isinstance(legacy_distance_map, dict):
+                raw_distance_mm = legacy_distance_map.get(
+                    str(normalized_sensor_id),
+                    legacy_distance_map.get(normalized_sensor_id),
+                )
+            return DistanceSensorInfo(
+                sensor_id=normalized_sensor_id,
+                enabled=True,
+                kind="hc_sr04",
+                trigger_pin=None,
+                echo_pin=None,
+                serial_rx_pin=None,
+                serial_tx_pin=None,
+                serial_settings_available=False,
+                distance_mm=None if raw_distance_mm is None else float(raw_distance_mm),
+            )
+
+        return DistanceSensorInfo(
+            sensor_id=normalized_sensor_id,
+            enabled=False,
+            kind="disabled",
+            trigger_pin=None,
+            echo_pin=None,
+            serial_rx_pin=None,
+            serial_tx_pin=None,
+            serial_settings_available=False,
+            distance_mm=None,
+        )
+
+    def _get_urm37_temperature(self, sensor_id: int) -> float:
+        normalized_sensor_id = _validate_sensor_id(sensor_id)
+        return self._run_logged_action(
+            category="sensor",
+            action="distance_sensor.get_temperature",
+            params={"sensor_id": normalized_sensor_id},
+            protocol_op="get_urm37_temperature",
+            operation=lambda: self._read_urm37_temperature(normalized_sensor_id),
+            success_text=lambda temperature_c: (
+                f"Получена температура URM37 с датчика {normalized_sensor_id}: {temperature_c:.2f} C — Удачно"
+            ),
+            error_text=lambda exc: f"Не удалось получить температуру URM37 с датчика {normalized_sensor_id}: {exc}",
+            result_transform=lambda temperature_c: {
+                "sensor_id": normalized_sensor_id,
+                "temperature_c": round(float(temperature_c), 4),
+            },
+        )
+
+    def _read_urm37_temperature(self, sensor_id: int) -> float:
+        response = self._send_request(
+            "get_urm37_temperature",
+            {"sensor": _validate_sensor_id(sensor_id)},
+            idempotent=True,
+            retries=self._retry_count,
+        )
+        return float(response["temperature_c"])
+
+    def _get_urm37_settings(self, sensor_id: int) -> Urm37Settings:
+        normalized_sensor_id = _validate_sensor_id(sensor_id)
+        return self._run_logged_action(
+            category="sensor",
+            action="distance_sensor.get_urm37_settings",
+            params={"sensor_id": normalized_sensor_id},
+            protocol_op="get_urm37_settings",
+            operation=lambda: self._read_urm37_settings(normalized_sensor_id),
+            success_text=lambda settings: (
+                f"Получены настройки URM37 для датчика {settings.sensor_id}: mode={settings.measure_mode} — Удачно"
+            ),
+            error_text=lambda exc: f"Не удалось получить настройки URM37 для датчика {normalized_sensor_id}: {exc}",
+            result_transform=lambda settings: asdict(settings),
+        )
+
+    def _read_urm37_settings(self, sensor_id: int) -> Urm37Settings:
+        response = self._send_request(
+            "get_urm37_settings",
+            {"sensor": _validate_sensor_id(sensor_id)},
+            idempotent=True,
+            retries=self._retry_count,
+        )
+        return self._parse_urm37_settings_response(response, sensor_id=sensor_id)
+
+    def _configure_urm37(
+        self,
+        sensor_id: int,
+        *,
+        measure_mode: Urm37MeasureMode | None = None,
+        auto_measure_interval_ms: int | None = None,
+        compare_distance_cm: int | None = None,
+        sensitivity: int | None = None,
+    ) -> Urm37Settings:
+        normalized_sensor_id = _validate_sensor_id(sensor_id)
+        args: dict[str, Any] = {"sensor": normalized_sensor_id}
+        if measure_mode is not None:
+            args["measure_mode"] = _validate_urm37_measure_mode(measure_mode)
+        if auto_measure_interval_ms is not None:
+            args["auto_measure_interval_ms"] = _validate_urm37_auto_measure_interval_ms(auto_measure_interval_ms)
+        if compare_distance_cm is not None:
+            args["compare_distance_cm"] = _validate_urm37_compare_distance_cm(compare_distance_cm)
+        if sensitivity is not None:
+            args["sensitivity"] = _validate_urm37_sensitivity(sensitivity)
+        if len(args) == 1:
+            raise ValueError("Нужно указать хотя бы одну настройку URM37 для обновления")
+
+        return self._run_logged_action(
+            category="sensor",
+            action="distance_sensor.configure_urm37",
+            params={key: value for key, value in args.items() if key != "sensor"} | {"sensor_id": normalized_sensor_id},
+            protocol_op="set_urm37_settings",
+            operation=lambda: self._write_urm37_settings(args, sensor_id=normalized_sensor_id),
+            success_text=lambda settings: (
+                f"Настройки URM37 для датчика {settings.sensor_id} обновлены: mode={settings.measure_mode} — Выполнено"
+            ),
+            error_text=lambda exc: f"Не удалось обновить настройки URM37 для датчика {normalized_sensor_id}: {exc}",
+            result_transform=lambda settings: asdict(settings),
+        )
+
+    def _write_urm37_settings(self, args: dict[str, Any], *, sensor_id: int) -> Urm37Settings:
+        response = self._send_request("set_urm37_settings", args)
+        return self._parse_urm37_settings_response(response, sensor_id=sensor_id)
+
+    def _parse_urm37_settings_response(self, response: dict[str, Any], *, sensor_id: int) -> Urm37Settings:
+        return Urm37Settings(
+            sensor_id=_validate_sensor_id(sensor_id),
+            measure_mode=_validate_urm37_measure_mode(str(response["measure_mode"])),
+            auto_measure_interval_ms=_validate_urm37_auto_measure_interval_ms(int(response["auto_measure_interval_ms"])),
+            compare_distance_cm=_validate_urm37_compare_distance_cm(int(response["compare_distance_cm"])),
+            sensitivity=_validate_urm37_sensitivity(int(response["sensitivity"])),
+        )
+
+    @staticmethod
+    def _coerce_optional_int(value: Any) -> int | None:
+        if value is None:
+            return None
+        return int(value)
+
     def _align_parallel_to_wall_impl(
         self,
         *,
@@ -820,11 +1079,9 @@ class ArduinoService:
         settle_seconds: float,
         max_iterations: int,
     ) -> dict[str, Any]:
-        if front_sensor_id not in (1, 2):
-            raise ValueError("front_sensor_id должен быть равен 1 или 2")
-        if rear_sensor_id not in (1, 2):
-            raise ValueError("rear_sensor_id должен быть равен 1 или 2")
-        if front_sensor_id == rear_sensor_id:
+        normalized_front_sensor_id = _validate_sensor_id(front_sensor_id, field_name="front_sensor_id")
+        normalized_rear_sensor_id = _validate_sensor_id(rear_sensor_id, field_name="rear_sensor_id")
+        if normalized_front_sensor_id == normalized_rear_sensor_id:
             raise ValueError("front_sensor_id и rear_sensor_id должны указывать на разные датчики")
         if wall_side not in ("left", "right"):
             raise ValueError('wall_side должен быть равен "left" или "right"')
@@ -848,8 +1105,8 @@ class ArduinoService:
         last_turn_direction: RotationDirection | None = None
 
         for iteration in range(1, max_iterations + 1):
-            last_front_distance_mm = self.distance_sensor.get(front_sensor_id, unit="mm")
-            last_rear_distance_mm = self.distance_sensor.get(rear_sensor_id, unit="mm")
+            last_front_distance_mm = self.distance_sensor.get(normalized_front_sensor_id, unit="mm")
+            last_rear_distance_mm = self.distance_sensor.get(normalized_rear_sensor_id, unit="mm")
             last_delta_mm = float(last_front_distance_mm - last_rear_distance_mm)
 
             self._logger.info(
@@ -945,11 +1202,10 @@ class ArduinoService:
         *,
         raw_distance_holder: Callable[[float], None] | None = None,
     ) -> float:
-        if sensor_id not in (1, 2):
-            raise ValueError("sensor_id должен быть равен 1 или 2")
+        normalized_sensor_id = _validate_sensor_id(sensor_id)
         response = self._send_request(
             "get_distance",
-            {"sensor": sensor_id},
+            {"sensor": normalized_sensor_id},
             idempotent=True,
             retries=self._retry_count,
         )
@@ -1887,6 +2143,40 @@ class DistanceSensorAccessor:
                 повреждён.
         """
         return self._service._get_distance_value(sensor_id, unit)
+
+    def info(self, sensor_id: int) -> DistanceSensorInfo:
+        """Возвращает сводную конфигурацию слота датчика расстояния."""
+
+        return self._service._get_distance_sensor_info(sensor_id)
+
+    def get_temperature(self, sensor_id: int) -> float:
+        """Читает температуру с URM37 в градусах Цельсия."""
+
+        return self._service._get_urm37_temperature(sensor_id)
+
+    def get_urm37_settings(self, sensor_id: int) -> Urm37Settings:
+        """Возвращает безопасный набор настроек URM37."""
+
+        return self._service._get_urm37_settings(sensor_id)
+
+    def configure_urm37(
+        self,
+        sensor_id: int,
+        *,
+        measure_mode: Urm37MeasureMode | None = None,
+        auto_measure_interval_ms: int | None = None,
+        compare_distance_cm: int | None = None,
+        sensitivity: int | None = None,
+    ) -> Urm37Settings:
+        """Частично обновляет безопасный набор настроек URM37."""
+
+        return self._service._configure_urm37(
+            sensor_id,
+            measure_mode=measure_mode,
+            auto_measure_interval_ms=auto_measure_interval_ms,
+            compare_distance_cm=compare_distance_cm,
+            sensitivity=sensitivity,
+        )
 
 
 class MotorChannel:

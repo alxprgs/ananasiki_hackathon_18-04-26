@@ -25,9 +25,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--sensors",
         nargs="+",
         type=int,
-        choices=(1, 2),
+        choices=tuple(range(1, 5)),
         default=[1, 2],
-        help="Какие датчики проверять: 1, 2 или оба сразу.",
+        help="Какие датчики проверять: от 1 до 4.",
     )
     parser.add_argument(
         "--interval",
