@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import unittest
 from dataclasses import dataclass
@@ -70,6 +71,13 @@ class ArduinoServiceTests(unittest.TestCase):
         root.mkdir(parents=True, exist_ok=True)
         self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
         return root
+
+    @staticmethod
+    def _extract_polyline_points(svg: str) -> list[str]:
+        match = re.search(r'<polyline[^>]*points="([^"]+)"', svg)
+        if match is None:
+            raise AssertionError("route.svg does not contain a polyline")
+        return [point for point in match.group(1).split() if point]
 
     def test_autodetects_first_valid_port(self) -> None:
         connections = {
@@ -693,6 +701,102 @@ class ArduinoServiceTests(unittest.TestCase):
         set_motor_event = next(event for event in events if event["action"] == "set_motor")
         self.assertEqual(set_motor_event["params"]["start_pwm"], 0)
         self.assertEqual(set_motor_event["params"]["ramp_duration_ms"], 1000)
+        service.close()
+
+    def test_activity_session_integrates_curved_motion_for_single_right_motor(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"target":"right","pwm":100,"duration_ms":10000}}\n',
+            ]
+        )
+        clock = FakeClock(start=300.0)
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.activity.curved.right"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+            monotonic_clock=clock.now,
+        )
+
+        session_dir = self._make_test_dir("activity_curved_right") / "session"
+        service.start_activity_session(output_dir=session_dir)
+
+        with patch("raspberry.arduino_service.time.sleep", side_effect=lambda seconds: clock.advance(seconds)):
+            service.eng_r.pwm(100).time(10.0)
+        summary = service.stop_activity_session()
+
+        self.assertAlmostEqual(summary["final_pose"]["x_mm"], 0.0, places=3)
+        self.assertAlmostEqual(summary["final_pose"]["y_mm"], 203.718, places=3)
+        self.assertAlmostEqual(summary["final_pose"]["heading_deg"], -180.0, places=3)
+
+        route_svg = (session_dir / "route.svg").read_text(encoding="utf-8")
+        self.assertGreater(len(self._extract_polyline_points(route_svg)), 2)
+        service.close()
+
+    def test_activity_session_close_records_partial_curved_timed_motion(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"target":"right","pwm":50,"duration_ms":10000}}\n',
+            ]
+        )
+        clock = FakeClock(start=400.0)
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.activity.curved.partial"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+            monotonic_clock=clock.now,
+        )
+
+        session_dir = self._make_test_dir("activity_curved_partial") / "session"
+        service.start_activity_session(output_dir=session_dir)
+        service._send_motor_command(target="right", pwm=50, duration_ms=10000)
+        clock.advance(2.485)
+        service.close()
+
+        events = json.loads((session_dir / "events.json").read_text(encoding="utf-8"))
+        stop_event = next(event for event in events if event["action"] == "stop_activity_session")
+        self.assertAlmostEqual(stop_event["position"]["x_mm"], 94.558, places=3)
+        self.assertAlmostEqual(stop_event["position"]["y_mm"], 139.728, places=3)
+        self.assertAlmostEqual(stop_event["position"]["heading_deg"], 111.825, places=3)
+
+        route_svg = (session_dir / "route.svg").read_text(encoding="utf-8")
+        self.assertGreater(len(self._extract_polyline_points(route_svg)), 2)
+
+    def test_activity_session_integrates_curved_motion_for_single_left_motor(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"target":"left","pwm":100,"duration_ms":10000}}\n',
+            ]
+        )
+        clock = FakeClock(start=500.0)
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.activity.curved.left"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+            monotonic_clock=clock.now,
+        )
+
+        session_dir = self._make_test_dir("activity_curved_left") / "session"
+        service.start_activity_session(output_dir=session_dir)
+
+        with patch("raspberry.arduino_service.time.sleep", side_effect=lambda seconds: clock.advance(seconds)):
+            service.eng_l.pwm(100).time(10.0)
+        summary = service.stop_activity_session()
+
+        self.assertAlmostEqual(summary["final_pose"]["x_mm"], 0.0, places=3)
+        self.assertAlmostEqual(summary["final_pose"]["y_mm"], -203.718, places=3)
+        self.assertAlmostEqual(summary["final_pose"]["heading_deg"], -180.0, places=3)
+
+        route_svg = (session_dir / "route.svg").read_text(encoding="utf-8")
+        self.assertGreater(len(self._extract_polyline_points(route_svg)), 2)
         service.close()
 
     def test_no_activity_artifacts_created_when_recording_is_disabled(self) -> None:

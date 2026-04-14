@@ -32,6 +32,7 @@ except ImportError:  # pragma: no cover - проверяется через вн
 LOGGER = logging.getLogger(__name__)
 DEFAULT_CONNECT_WARMUP_SECONDS = 2.0
 LOW_MOTOR_PWM_WARNING_THRESHOLD = 60
+MOTION_ROUTE_SLICE_SECONDS = 0.05
 UnitName = Literal["mm", "cm", "m"]
 MotorTarget = Literal["all", "left", "right"]
 WallSide = Literal["left", "right"]
@@ -1342,9 +1343,7 @@ class ArduinoService:
 
             delta_seconds = segment_end - state.last_monotonic
             if delta_seconds > epsilon:
-                self._integrate_motion_segment(state, session.calibration, state.last_monotonic, segment_end)
-                state.last_monotonic = segment_end
-                self._append_route_point()
+                self._advance_motion_segment(session, segment_end, epsilon=epsilon)
             else:
                 state.last_monotonic = segment_end
 
@@ -1357,6 +1356,40 @@ class ArduinoService:
                 state.right_pwm = 0
                 state.right_auto_stop_at = None
                 self._clear_motor_ramp_state(state, "right")
+
+    def _advance_motion_segment(
+        self,
+        session: _ActivitySession,
+        target_monotonic: float,
+        *,
+        epsilon: float,
+    ) -> None:
+        state = session.motion_state
+        while target_monotonic > state.last_monotonic + epsilon:
+            slice_end = target_monotonic
+            if self._should_sample_motion_segment(state, session.calibration, state.last_monotonic, target_monotonic):
+                slice_end = min(state.last_monotonic + MOTION_ROUTE_SLICE_SECONDS, target_monotonic)
+
+            self._integrate_motion_segment(state, session.calibration, state.last_monotonic, slice_end)
+            state.last_monotonic = slice_end
+            self._append_route_point()
+
+    def _should_sample_motion_segment(
+        self,
+        state: _MotionState,
+        calibration: MotionMapCalibration,
+        started_at: float,
+        ended_at: float,
+    ) -> bool:
+        if self._motor_ramp_overlaps_interval(state, "left", started_at, ended_at):
+            return True
+        if self._motor_ramp_overlaps_interval(state, "right", started_at, ended_at):
+            return True
+
+        left_ratio = self._average_motor_pwm_for_interval(state, "left", started_at, ended_at) / 100.0
+        right_ratio = self._average_motor_pwm_for_interval(state, "right", started_at, ended_at) / 100.0
+        angular_speed_deg = ((right_ratio - left_ratio) / 2.0) * calibration.max_turn_deg_per_sec
+        return abs(angular_speed_deg) > 1e-9
 
     def _integrate_motion_segment(
         self,
@@ -1374,11 +1407,18 @@ class ArduinoService:
         linear_speed = ((left_ratio + right_ratio) / 2.0) * calibration.max_linear_speed_mm_per_sec
         angular_speed_deg = ((right_ratio - left_ratio) / 2.0) * calibration.max_turn_deg_per_sec
         heading_delta_deg = angular_speed_deg * delta_seconds
-        heading_mid_rad = math.radians(state.heading_deg + (heading_delta_deg / 2.0))
-        distance_mm = linear_speed * delta_seconds
-
-        state.x_mm += distance_mm * math.cos(heading_mid_rad)
-        state.y_mm += distance_mm * math.sin(heading_mid_rad)
+        if abs(angular_speed_deg) <= 1e-9:
+            heading_rad = math.radians(state.heading_deg)
+            distance_mm = linear_speed * delta_seconds
+            state.x_mm += distance_mm * math.cos(heading_rad)
+            state.y_mm += distance_mm * math.sin(heading_rad)
+        else:
+            heading_start_rad = math.radians(state.heading_deg)
+            heading_end_rad = math.radians(state.heading_deg + heading_delta_deg)
+            angular_speed_rad = math.radians(angular_speed_deg)
+            turn_radius_mm = linear_speed / angular_speed_rad
+            state.x_mm += turn_radius_mm * (math.sin(heading_end_rad) - math.sin(heading_start_rad))
+            state.y_mm += turn_radius_mm * (math.cos(heading_start_rad) - math.cos(heading_end_rad))
         state.heading_deg = self._normalize_heading(state.heading_deg + heading_delta_deg)
 
     def _warn_about_motor_pwm_profile(
@@ -1478,6 +1518,19 @@ class ArduinoService:
         pwm_at_start = start_pwm + ((stop_pwm - start_pwm) * start_progress)
         pwm_at_end = start_pwm + ((stop_pwm - start_pwm) * end_progress)
         return (pwm_at_start + pwm_at_end) / 2.0
+
+    @staticmethod
+    def _motor_ramp_overlaps_interval(
+        state: _MotionState,
+        channel: Literal["left", "right"],
+        started_at: float,
+        ended_at: float,
+    ) -> bool:
+        ramp_started_at = getattr(state, f"{channel}_ramp_started_at")
+        ramp_ends_at = getattr(state, f"{channel}_ramp_ends_at")
+        if ramp_started_at is None or ramp_ends_at is None:
+            return False
+        return started_at < ramp_ends_at and ended_at > ramp_started_at
 
     def _append_route_point(self, label: str | None = None) -> None:
         session = self._activity_session

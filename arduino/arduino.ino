@@ -651,8 +651,8 @@ void beginSensorCycle(DistanceSensorState& sensor) {
 
 // Завершаем цикл измерения и сохраняем результат только если он валиден.
 bool finishSensorCycle(DistanceSensorState& sensor, bool validMeasurement, long distanceMm) {
-  sensor.valid = validMeasurement;
   if (validMeasurement) {
+    sensor.valid = true;
     sensor.lastDistanceMm = distanceMm;
     sensor.lastSuccessAtMs = millis();
   }
