@@ -6,21 +6,12 @@
 #endif
 
 #ifndef SERVO_FEATURE_ENABLED
-#define SERVO_FEATURE_ENABLED 0
+#define SERVO_FEATURE_ENABLED 1
 #endif
 
 #include <SoftwareSerial.h>
-#if SERVO_FEATURE_ENABLED
-#if defined(__has_include)
-#if __has_include(<Servo.h>)
+
 #include <Servo.h>
-#else
-#error "SERVO_FEATURE_ENABLED requires Servo.h. Install the Servo library or set SERVO_FEATURE_ENABLED to 0."
-#endif
-#else
-#include <Servo.h>
-#endif
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -86,9 +77,13 @@ constexpr bool LEFT_TRACK_INVERTED = false;
 constexpr bool RIGHT_TRACK_INVERTED = true;
 constexpr bool SERVO_ENABLED = SERVO_FEATURE_ENABLED != 0;
 constexpr bool RELAY_ENABLED = false;
+<<<<<<< Updated upstream
 constexpr bool STEPPER_ENABLED = false;
 constexpr bool LED_ENABLED = false;
 constexpr bool BUZZER_ENABLED = false;
+=======
+constexpr bool STEPPER_ENABLED = true;
+>>>>>>> Stashed changes
 constexpr bool STEPPER_ENABLE_ACTIVE_LOW = true;
 constexpr uint8_t PIN_NOT_ASSIGNED = 0xFF;
 constexpr uint8_t DISTANCE_SENSOR_COUNT = 4;
