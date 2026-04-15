@@ -56,7 +56,7 @@
 - чтение кнопки;
 - watchdog по времени отсутствия команд;
 - timed-команды для моторов;
-- поддержку опциональных модулей: `servo`, `relay`, `stepper`.
+- поддержку опциональных модулей: `servo`, `relay`, `led`, `buzzer`, `stepper`.
 
 #### Подробно о прошивке Arduino
 
@@ -89,7 +89,7 @@
 
 - в `setup()` поднимается serial-порт с нужной скоростью;
 - все пины переводятся в безопасное начальное состояние;
-- серва, реле и шаговый драйвер инициализируются только если они включены в конфигурации;
+- серва, реле, LED, buzzer и шаговый драйвер инициализируются только если они включены в конфигурации;
 - стартует таймер watchdog, чтобы робот не начал ехать сам по себе после сброса платы.
 
 Как работает основной цикл:
@@ -111,9 +111,10 @@
 - скорость serial через `SERIAL_BAUD`;
 - время watchdog через `COMMAND_WATCHDOG_MS`;
 - интервалы опроса ультразвука и таймаут echo;
-- распиновка моторов, датчиков, кнопки, сервы, реле и шагового драйвера;
+- распиновка моторов, датчиков, кнопки, сервы, реле, LED, buzzer и шагового драйвера;
 - флаги `SWAP_TRACK_MOTORS`, `LEFT_TRACK_INVERTED`, `RIGHT_TRACK_INVERTED`;
-- флаги `SERVO_ENABLED`, `RELAY_ENABLED`, `STEPPER_ENABLED`;
+- флаги `SERVO_ENABLED`, `RELAY_ENABLED`, `LED_ENABLED`, `BUZZER_ENABLED`, `STEPPER_ENABLED`;
+- по умолчанию `LED_ENABLED=false` и `BUZZER_ENABLED=false`, а их дефолтные пины в конфиге — `A4` и `A5`;
 - логика включения драйвера шагового двигателя через `STEPPER_ENABLE_ACTIVE_LOW`.
 
 Как адаптировать прошивку под другое железо:
@@ -154,7 +155,7 @@
 
 Как прошивка относится к optional-модулям:
 
-- `servo`, `relay` и `stepper` можно отключить флагами конфигурации;
+- `servo`, `relay`, `led`, `buzzer` и `stepper` можно отключить флагами конфигурации;
 - если Raspberry Pi вызовет команду к отключённому модулю, Arduino вернёт ошибку `unsupported`;
 - это безопаснее, чем молча игнорировать запрос.
 
@@ -213,6 +214,9 @@ Python-слой разделён на два сервиса:
 - `stop_all`
 - `set_servo`
 - `set_relay`
+- `set_led`
+- `buzzer_play`
+- `buzzer_stop`
 - `stepper_move`
 - `stepper_stop`
 
@@ -222,6 +226,7 @@ Python-слой разделён на два сервиса:
 - `get_status` сохраняет совместимое поле `distance_mm`, но теперь отдаёт его для слотов `1..4` и дополнительно включает подробный блок `distance_sensors`;
 - `distance_sensors` содержит `enabled`, `kind`, `pins`, `serial_settings_available` и последнее `distance_mm` для каждого слота;
 - URM37-специфичные команды возвращают `unsupported`, если выбран не `URM37`, и `not_configured`, если у URM37 не заданы оба `serial_rx`/`serial_tx`.
+- `set_led`, `buzzer_play` и `buzzer_stop` тоже возвращают `unsupported`, если соответствующий optional-модуль выключен в конфиге прошивки.
 
 ## Публичный Python API
 
@@ -253,6 +258,9 @@ with ArduinoService() as arduino:
 
     arduino.servo.set(90)
     arduino.relay.on()
+    arduino.led.on()
+    arduino.buzzer.beep()
+    arduino.buzzer.success()
     arduino.stepper.move(steps=200, rpm=30, direction="forward")
     arduino.stepper.stop()
 ```
@@ -272,6 +280,9 @@ with ArduinoService() as arduino:
 - `eng_r.pwm(percent).now()`
 - `servo.set(angle_deg)`
 - `relay.on()`, `relay.off()`, `relay.set(enabled)`
+- `led.on()`, `led.off()`, `led.set(enabled)`
+- `buzzer.on(...)`, `buzzer.off()`, `buzzer.tone(...)`, `buzzer.beep(...)`
+- `buzzer.play_sequence(...)`, `buzzer.success()`, `buzzer.warning()`, `buzzer.error()`
 - `stepper.move(...)`, `stepper.stop()`
 - `start_activity_session(...)`
 - `stop_activity_session()`
@@ -701,6 +712,78 @@ arduino.relay.set(True)
 - для включения дополнительной нагрузки;
 - для активации механизма через силовой канал;
 - для ручной проверки релейного выхода.
+
+#### Управление LED: `led.on()`, `led.off()`, `led.set(enabled)` и `set_led(enabled)`
+
+Назначение:
+
+- `led.on()` — включает LED;
+- `led.off()` — выключает LED;
+- `led.set(enabled)` — устанавливает произвольное состояние LED;
+- `set_led(enabled)` — прямой низкоуровневый метод `ArduinoService`.
+
+Параметры:
+
+- `enabled` — `True`, если LED нужно включить, и `False`, если выключить.
+
+Примеры:
+
+```python
+arduino.led.on()
+arduino.led.off()
+arduino.led.set(True)
+```
+
+Важно:
+
+- LED по умолчанию выключен при старте платы;
+- поддержка LED выключена по умолчанию в `Config`, и для её включения нужно выставить `LED_ENABLED=true`;
+- дефолтный пин LED в прошивке — `A4`.
+
+#### Управление buzzer: `buzzer.on(...)`, `buzzer.off()`, `buzzer.tone(...)`, `buzzer.beep(...)`, `buzzer.play_sequence(...)`
+
+Назначение:
+
+- `buzzer.on(frequency_hz=2000)` — запускает непрерывный тон;
+- `buzzer.off()` — останавливает текущий тон;
+- `buzzer.tone(frequency_hz, duration=...)` — проигрывает один тон;
+- `buzzer.beep(...)` — собирает один или несколько коротких сигналов;
+- `buzzer.play_sequence(...)` — проигрывает последовательность шагов `BuzzerStep`;
+- `buzzer.success()`, `buzzer.warning()`, `buzzer.error()` — готовые сигнальные шаблоны.
+
+Параметры:
+
+- `frequency_hz` — частота в диапазоне `31..10000` Гц;
+- `duration` — длительность тона в секундах для high-level API;
+- `duration_ms` — длительность в миллисекундах для low-level `play_buzzer(...)`;
+- `repeat` — сколько раз повторить последовательность;
+- `BuzzerStep(frequency_hz=None, duration_ms=...)` — пауза/тишина между тонами.
+
+Примеры:
+
+```python
+from raspberry.arduino_service import BuzzerStep
+
+arduino.buzzer.on(1800)
+arduino.buzzer.off()
+arduino.buzzer.tone(1500, duration=0.25)
+arduino.buzzer.beep(frequency_hz=2200, duration=0.1, pause=0.05, repeat=2)
+arduino.buzzer.play_sequence(
+    [
+        BuzzerStep(frequency_hz=1200, duration_ms=80),
+        BuzzerStep(frequency_hz=None, duration_ms=40),
+        BuzzerStep(frequency_hz=1800, duration_ms=120),
+    ]
+)
+arduino.buzzer.success()
+```
+
+Важно:
+
+- buzzer по умолчанию молчит при старте платы;
+- поддержка buzzer выключена по умолчанию в `Config`, и для её включения нужно выставить `BUZZER_ENABLED=true`;
+- дефолтный пин buzzer в прошивке — `A5`;
+- богатые сигналы и последовательности собираются на стороне Python API, а Arduino получает только простые команды `buzzer_play` и `buzzer_stop`.
 
 #### Управление шаговым двигателем: `stepper.move(...)`, `stepper.stop()`, `move_stepper(...)`, `stop_stepper()`
 
@@ -1446,4 +1529,4 @@ python -m unittest discover -s tests -v
 - Движение сейчас open-loop: без энкодеров время и PWM не дают точной одометрии.
 - Некоторые команды Raspberry Pi требуют повышенных прав.
   Проверка этих прав встроена в `RaspberryService` и срабатывает только на реальной Raspberry Pi.
-- Опциональные модули `servo`, `relay`, `stepper` можно отключать в конфигурации прошивки; в этом случае Arduino будет возвращать явную ошибку `unsupported`.
+- Опциональные модули `servo`, `relay`, `led`, `buzzer`, `stepper` можно отключать в конфигурации прошивки; в этом случае Arduino будет возвращать явную ошибку `unsupported`.

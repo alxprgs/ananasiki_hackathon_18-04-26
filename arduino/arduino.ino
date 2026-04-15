@@ -87,6 +87,8 @@ constexpr bool RIGHT_TRACK_INVERTED = true;
 constexpr bool SERVO_ENABLED = SERVO_FEATURE_ENABLED != 0;
 constexpr bool RELAY_ENABLED = false;
 constexpr bool STEPPER_ENABLED = false;
+constexpr bool LED_ENABLED = false;
+constexpr bool BUZZER_ENABLED = false;
 constexpr bool STEPPER_ENABLE_ACTIVE_LOW = true;
 constexpr uint8_t PIN_NOT_ASSIGNED = 0xFF;
 constexpr uint8_t DISTANCE_SENSOR_COUNT = 4;
@@ -118,6 +120,8 @@ constexpr uint8_t SENSOR4_SERIAL_RX_PIN = PIN_NOT_ASSIGNED;
 constexpr uint8_t SENSOR4_SERIAL_TX_PIN = PIN_NOT_ASSIGNED;
 constexpr uint8_t STEPPER_ENABLE_PIN = A0;
 constexpr uint8_t BUTTON_PIN = A1;
+constexpr uint8_t LED_PIN = A4;
+constexpr uint8_t BUZZER_PIN = A5;
 }  // namespace Config
 
 /*
@@ -221,6 +225,13 @@ struct StepperRuntimeState {
   unsigned long stepIntervalUs;
 };
 
+struct BuzzerRuntimeState {
+  bool playing;
+  bool timed;
+  unsigned int frequencyHz;
+  unsigned long stopAtMs;
+};
+
 constexpr size_t REQUEST_BUFFER_SIZE = 192;
 char gRequestBuffer[REQUEST_BUFFER_SIZE];
 size_t gRequestLength = 0;
@@ -319,6 +330,8 @@ bool gServoAttached = false;
 int gServoAngle = 90;
 #endif
 bool gRelayEnabled = false;
+bool gLedEnabled = false;
+BuzzerRuntimeState gBuzzer = {false, false, 0, 0};
 unsigned long gLastValidCommandAtMs = 0;
 bool gWatchdogTriggered = false;
 
@@ -385,6 +398,12 @@ bool isBaseHardwarePin(uint8_t pin) {
     return true;
   }
   if (Config::RELAY_ENABLED && pin == Config::RELAY_PIN) {
+    return true;
+  }
+  if (Config::LED_ENABLED && pin == Config::LED_PIN) {
+    return true;
+  }
+  if (Config::BUZZER_ENABLED && pin == Config::BUZZER_PIN) {
     return true;
   }
   if (Config::STEPPER_ENABLED &&
@@ -903,6 +922,22 @@ void applyMotorOutput(const MotorPins& pins, int percent) {
 
 void stopStepper();
 
+void stopBuzzer() {
+  if (!Config::BUZZER_ENABLED) {
+    gBuzzer.playing = false;
+    gBuzzer.timed = false;
+    gBuzzer.frequencyHz = 0;
+    gBuzzer.stopAtMs = 0;
+    return;
+  }
+  noTone(Config::BUZZER_PIN);
+  digitalWrite(Config::BUZZER_PIN, LOW);
+  gBuzzer.playing = false;
+  gBuzzer.timed = false;
+  gBuzzer.frequencyHz = 0;
+  gBuzzer.stopAtMs = 0;
+}
+
 // Полная остановка всех исполнительных механизмов, которые могут двигать робота.
 void stopAllMotion() {
   gLeftMotor.currentPercent = 0;
@@ -1053,6 +1088,16 @@ void updateMotorTimers() {
     if (stoppedUnsafeMotion) {
       gWatchdogTriggered = true;
     }
+  }
+}
+
+void updateBuzzer() {
+  if (!Config::BUZZER_ENABLED || !gBuzzer.playing || !gBuzzer.timed) {
+    return;
+  }
+
+  if (hasElapsed(millis(), gBuzzer.stopAtMs)) {
+    stopBuzzer();
   }
 }
 
@@ -1342,12 +1387,26 @@ void sendStatusResponse(long requestId) {
   Serial.print(Config::COMMAND_WATCHDOG_MS);
   Serial.print(F(",\"relay_enabled\":"));
   printBool(gRelayEnabled);
+  Serial.print(F(",\"led_enabled\":"));
+  printBool(gLedEnabled);
+  Serial.print(F(",\"buzzer_playing\":"));
+  printBool(gBuzzer.playing);
+  Serial.print(F(",\"buzzer_frequency_hz\":"));
+  if (gBuzzer.playing) {
+    Serial.print(gBuzzer.frequencyHz);
+  } else {
+    Serial.print(F("null"));
+  }
   Serial.print(F(",\"stepper_running\":"));
   printBool(gStepper.running);
   Serial.print(F(",\"features\":{\"servo\":"));
   printBool(Config::SERVO_ENABLED);
   Serial.print(F(",\"relay\":"));
   printBool(Config::RELAY_ENABLED);
+  Serial.print(F(",\"led\":"));
+  printBool(Config::LED_ENABLED);
+  Serial.print(F(",\"buzzer\":"));
+  printBool(Config::BUZZER_ENABLED);
   Serial.print(F(",\"stepper\":"));
   printBool(Config::STEPPER_ENABLED);
   Serial.print(F("},\"distance_mm\":{"));
@@ -1708,6 +1767,90 @@ void handleSetRelay(long requestId, const char* payload) {
   Serial.println(F("}}"));
 }
 
+void handleSetLed(long requestId, const char* payload) {
+  if (!Config::LED_ENABLED) {
+    sendErrorResponse(requestId, F("unsupported"), F("LED is not configured"));
+    return;
+  }
+
+  bool enabled = false;
+  if (!extractBoolField(payload, PSTR("enabled"), enabled)) {
+    sendErrorResponse(requestId, F("bad_request"), F("enabled field is required"));
+    return;
+  }
+
+  gLedEnabled = enabled;
+  digitalWrite(Config::LED_PIN, enabled ? HIGH : LOW);
+
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.print(F(",\"ok\":true,\"data\":{\"enabled\":"));
+  printBool(gLedEnabled);
+  Serial.println(F("}}"));
+}
+
+void handleBuzzerPlay(long requestId, const char* payload) {
+  if (!Config::BUZZER_ENABLED) {
+    sendErrorResponse(requestId, F("unsupported"), F("buzzer is not configured"));
+    return;
+  }
+
+  long frequencyHz = 0;
+  if (!extractLongField(payload, PSTR("frequency_hz"), frequencyHz)) {
+    sendErrorResponse(requestId, F("bad_request"), F("frequency_hz field is required"));
+    return;
+  }
+  if (frequencyHz < 31 || frequencyHz > 10000) {
+    sendErrorResponse(requestId, F("bad_request"), F("frequency_hz must be in range 31..10000"));
+    return;
+  }
+
+  long durationMs = 0;
+  bool hasDuration = extractLongField(payload, PSTR("duration_ms"), durationMs);
+  if (hasDuration && durationMs <= 0) {
+    sendErrorResponse(requestId, F("bad_request"), F("duration_ms must be greater than 0"));
+    return;
+  }
+
+  tone(Config::BUZZER_PIN, static_cast<unsigned int>(frequencyHz));
+  gBuzzer.playing = true;
+  gBuzzer.frequencyHz = static_cast<unsigned int>(frequencyHz);
+  if (hasDuration) {
+    gBuzzer.timed = true;
+    gBuzzer.stopAtMs = millis() + static_cast<unsigned long>(durationMs);
+  } else {
+    gBuzzer.timed = false;
+    gBuzzer.stopAtMs = 0;
+  }
+
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.print(F(",\"ok\":true,\"data\":{\"playing\":"));
+  printBool(gBuzzer.playing);
+  Serial.print(F(",\"frequency_hz\":"));
+  Serial.print(gBuzzer.frequencyHz);
+  Serial.print(F(",\"duration_ms\":"));
+  if (hasDuration) {
+    Serial.print(durationMs);
+  } else {
+    Serial.print(F("null"));
+  }
+  Serial.println(F("}}"));
+}
+
+void handleBuzzerStop(long requestId) {
+  if (!Config::BUZZER_ENABLED) {
+    sendErrorResponse(requestId, F("unsupported"), F("buzzer is not configured"));
+    return;
+  }
+
+  stopBuzzer();
+
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.println(F(",\"ok\":true,\"data\":{\"playing\":false,\"frequency_hz\":null}}"));
+}
+
 /*
  * Запуск шаговика с параметрами из JSON.
  *
@@ -1857,6 +2000,21 @@ void handleRequest(const char* payload) {
     return;
   }
 
+  if (equalsFlash(operation, PSTR("set_led"))) {
+    handleSetLed(requestId, payload);
+    return;
+  }
+
+  if (equalsFlash(operation, PSTR("buzzer_play"))) {
+    handleBuzzerPlay(requestId, payload);
+    return;
+  }
+
+  if (equalsFlash(operation, PSTR("buzzer_stop"))) {
+    handleBuzzerStop(requestId);
+    return;
+  }
+
   if (equalsFlash(operation, PSTR("stepper_move"))) {
     handleStepperMove(requestId, payload);
     return;
@@ -1968,6 +2126,18 @@ void setupPins() {
     gRelayEnabled = false;
   }
 
+  if (Config::LED_ENABLED) {
+    pinMode(Config::LED_PIN, OUTPUT);
+    digitalWrite(Config::LED_PIN, LOW);
+    gLedEnabled = false;
+  }
+
+  if (Config::BUZZER_ENABLED) {
+    pinMode(Config::BUZZER_PIN, OUTPUT);
+    digitalWrite(Config::BUZZER_PIN, LOW);
+  }
+  stopBuzzer();
+
   if (Config::STEPPER_ENABLED) {
     pinMode(Config::STEPPER_STEP_PIN, OUTPUT);
     pinMode(Config::STEPPER_DIR_PIN, OUTPUT);
@@ -2000,5 +2170,6 @@ void loop() {
   readSerialRequests();
   updateSensors();
   updateMotorTimers();
+  updateBuzzer();
   updateStepper();
 }

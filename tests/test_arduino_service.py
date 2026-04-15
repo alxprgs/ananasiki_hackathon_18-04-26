@@ -14,8 +14,10 @@ from raspberry.arduino_service import (
     ArduinoProtocolError,
     ArduinoService,
     ArduinoUnavailableError,
+    BuzzerStep,
     MotionMapCalibration,
     SerialTimeoutError,
+    UnsupportedHardwareError,
 )
 
 
@@ -160,7 +162,7 @@ class ArduinoServiceTests(unittest.TestCase):
         connection = FakeSerial(
             [
                 '{"id":1,"ok":true,"data":{"pong":true}}\n',
-                '{"id":2,"ok":true,"data":{"distance_sensors":{"1":{"enabled":true,"kind":"hc_sr04","pins":{"trigger":2,"echo":3,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":345},"2":{"enabled":true,"kind":"urm37","pins":{"trigger":8,"echo":9,"serial_rx":10,"serial_tx":11},"serial_settings_available":true,"distance_mm":680},"3":{"enabled":false,"kind":"disabled","pins":{"trigger":null,"echo":null,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":null},"4":{"enabled":false,"kind":"disabled","pins":{"trigger":null,"echo":null,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":null}}}}\n',
+                '{"id":2,"ok":true,"data":{"led_enabled":true,"buzzer_playing":true,"buzzer_frequency_hz":2200,"distance_sensors":{"1":{"enabled":true,"kind":"hc_sr04","pins":{"trigger":2,"echo":3,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":345},"2":{"enabled":true,"kind":"urm37","pins":{"trigger":8,"echo":9,"serial_rx":10,"serial_tx":11},"serial_settings_available":true,"distance_mm":680},"3":{"enabled":false,"kind":"disabled","pins":{"trigger":null,"echo":null,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":null},"4":{"enabled":false,"kind":"disabled","pins":{"trigger":null,"echo":null,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":null}},"features":{"led":true,"buzzer":true}}}\n',
             ]
         )
 
@@ -176,6 +178,11 @@ class ArduinoServiceTests(unittest.TestCase):
         self.assertIn("distance_sensors", payload)
         self.assertEqual(payload["distance_sensors"]["2"]["kind"], "urm37")
         self.assertTrue(payload["distance_sensors"]["2"]["serial_settings_available"])
+        self.assertTrue(payload["led_enabled"])
+        self.assertTrue(payload["buzzer_playing"])
+        self.assertEqual(payload["buzzer_frequency_hz"], 2200)
+        self.assertTrue(payload["features"]["led"])
+        self.assertTrue(payload["features"]["buzzer"])
         service.close()
 
     def test_distance_sensor_info_reads_extended_status(self) -> None:
@@ -368,6 +375,240 @@ class ArduinoServiceTests(unittest.TestCase):
         self.assertEqual(payload["args"]["pwm"], 80)
         self.assertNotIn("start_pwm", payload["args"])
         self.assertNotIn("ramp_duration_ms", payload["args"])
+        service.close()
+
+    def test_led_service_and_controller_send_expected_payloads(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"enabled":true}}\n',
+                '{"id":3,"ok":true,"data":{"enabled":false}}\n',
+                '{"id":4,"ok":true,"data":{"enabled":true}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.led"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        self.assertTrue(service.set_led(True)["enabled"])
+        self.assertFalse(service.led.off()["enabled"])
+        self.assertTrue(service.led.set(True)["enabled"])
+
+        payloads = [json.loads(raw) for raw in connection.writes[1:4]]
+        self.assertEqual([payload["op"] for payload in payloads], ["set_led", "set_led", "set_led"])
+        self.assertEqual([payload["args"]["enabled"] for payload in payloads], [True, False, True])
+        service.close()
+
+    def test_buzzer_service_and_controller_send_expected_ops(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"playing":true,"frequency_hz":2400,"duration_ms":150}}\n',
+                '{"id":3,"ok":true,"data":{"playing":false,"frequency_hz":null}}\n',
+                '{"id":4,"ok":true,"data":{"playing":true,"frequency_hz":1800,"duration_ms":null}}\n',
+                '{"id":5,"ok":true,"data":{"playing":false,"frequency_hz":null}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.buzzer.service"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        self.assertEqual(service.play_buzzer(2400, duration_ms=150)["frequency_hz"], 2400)
+        self.assertFalse(service.stop_buzzer()["playing"])
+        self.assertEqual(service.buzzer.on(1800)["frequency_hz"], 1800)
+        self.assertFalse(service.buzzer.off()["playing"])
+
+        first_payload = json.loads(connection.writes[1])
+        self.assertEqual(first_payload["op"], "buzzer_play")
+        self.assertEqual(first_payload["args"]["frequency_hz"], 2400)
+        self.assertEqual(first_payload["args"]["duration_ms"], 150)
+        stop_payload = json.loads(connection.writes[2])
+        self.assertEqual(stop_payload["op"], "buzzer_stop")
+        on_payload = json.loads(connection.writes[3])
+        self.assertEqual(on_payload["args"]["frequency_hz"], 1800)
+        self.assertNotIn("duration_ms", on_payload["args"])
+        service.close()
+
+    @patch("raspberry.arduino_service.time.sleep", return_value=None)
+    def test_buzzer_tone_waits_for_requested_duration(self, sleep_mock) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"playing":true,"frequency_hz":1500,"duration_ms":250}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.buzzer.tone"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        response = service.buzzer.tone(1500, duration=0.25)
+
+        self.assertEqual(response["duration_ms"], 250)
+        sleep_mock.assert_called_once_with(0.25)
+        service.close()
+
+    @patch("raspberry.arduino_service.time.sleep", return_value=None)
+    def test_buzzer_beep_issues_expected_sequence(self, sleep_mock) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"playing":true,"frequency_hz":2000,"duration_ms":100}}\n',
+                '{"id":3,"ok":true,"data":{"playing":false,"frequency_hz":null}}\n',
+                '{"id":4,"ok":true,"data":{"playing":true,"frequency_hz":2000,"duration_ms":100}}\n',
+                '{"id":5,"ok":true,"data":{"playing":false,"frequency_hz":null}}\n',
+                '{"id":6,"ok":true,"data":{"playing":false,"frequency_hz":null}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.buzzer.beep"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        result = service.buzzer.beep(duration=0.1, pause=0.05, repeat=2)
+
+        self.assertEqual(result["repeat"], 2)
+        ops = [json.loads(raw)["op"] for raw in connection.writes[1:]]
+        self.assertEqual(ops, ["buzzer_play", "buzzer_stop", "buzzer_play", "buzzer_stop", "buzzer_stop"])
+        self.assertEqual(sleep_mock.call_args_list[0].args[0], 0.1)
+        self.assertEqual(sleep_mock.call_args_list[1].args[0], 0.05)
+        self.assertEqual(sleep_mock.call_args_list[2].args[0], 0.1)
+        self.assertEqual(sleep_mock.call_args_list[3].args[0], 0.05)
+        service.close()
+
+    @patch("raspberry.arduino_service.time.sleep", return_value=None)
+    def test_buzzer_play_sequence_accepts_tone_and_pause_steps(self, sleep_mock) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"playing":true,"frequency_hz":1200,"duration_ms":80}}\n',
+                '{"id":3,"ok":true,"data":{"playing":false,"frequency_hz":null}}\n',
+                '{"id":4,"ok":true,"data":{"playing":true,"frequency_hz":1600,"duration_ms":90}}\n',
+                '{"id":5,"ok":true,"data":{"playing":false,"frequency_hz":null}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.buzzer.sequence"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        result = service.buzzer.play_sequence(
+            [
+                BuzzerStep(frequency_hz=1200, duration_ms=80),
+                BuzzerStep(frequency_hz=None, duration_ms=40),
+                BuzzerStep(frequency_hz=1600, duration_ms=90),
+            ]
+        )
+
+        self.assertEqual(result["total_duration_ms"], 210)
+        ops = [json.loads(raw)["op"] for raw in connection.writes[1:]]
+        self.assertEqual(ops, ["buzzer_play", "buzzer_stop", "buzzer_play", "buzzer_stop"])
+        self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [0.08, 0.04, 0.09])
+        service.close()
+
+    @patch("raspberry.arduino_service.time.sleep", return_value=None)
+    def test_buzzer_presets_use_fixed_sequences(self, _sleep) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"playing":true,"frequency_hz":1600,"duration_ms":90}}\n',
+                '{"id":3,"ok":true,"data":{"playing":false,"frequency_hz":null}}\n',
+                '{"id":4,"ok":true,"data":{"playing":true,"frequency_hz":2200,"duration_ms":140}}\n',
+                '{"id":5,"ok":true,"data":{"playing":false,"frequency_hz":null}}\n',
+                '{"id":6,"ok":true,"data":{"playing":true,"frequency_hz":1800,"duration_ms":120}}\n',
+                '{"id":7,"ok":true,"data":{"playing":false,"frequency_hz":null}}\n',
+                '{"id":8,"ok":true,"data":{"playing":true,"frequency_hz":1800,"duration_ms":120}}\n',
+                '{"id":9,"ok":true,"data":{"playing":false,"frequency_hz":null}}\n',
+                '{"id":10,"ok":true,"data":{"playing":true,"frequency_hz":700,"duration_ms":220}}\n',
+                '{"id":11,"ok":true,"data":{"playing":false,"frequency_hz":null}}\n',
+                '{"id":12,"ok":true,"data":{"playing":true,"frequency_hz":520,"duration_ms":320}}\n',
+                '{"id":13,"ok":true,"data":{"playing":false,"frequency_hz":null}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.buzzer.presets"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        service.buzzer.success()
+        service.buzzer.warning()
+        service.buzzer.error()
+
+        payloads = [json.loads(raw) for raw in connection.writes[1:]]
+        play_frequencies = [payload["args"]["frequency_hz"] for payload in payloads if payload["op"] == "buzzer_play"]
+        self.assertEqual(play_frequencies, [1600, 2200, 1800, 1800, 700, 520])
+        service.close()
+
+    def test_buzzer_validation_errors_happen_before_serial_write(self) -> None:
+        connection = FakeSerial(['{"id":1,"ok":true,"data":{"pong":true}}\n'])
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.buzzer.validation"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        with self.assertRaises(ValueError):
+            service.play_buzzer(10)
+        with self.assertRaises(ValueError):
+            service.buzzer.beep(duration=0)
+        with self.assertRaises(ValueError):
+            service.buzzer.play_sequence([], repeat=1)
+        with self.assertRaises(ValueError):
+            service.buzzer.play_sequence([BuzzerStep(frequency_hz=None, duration_ms=50)], repeat=0)
+
+        self.assertEqual(len(connection.writes), 1)
+        service.close()
+
+    def test_led_and_buzzer_unsupported_errors_are_mapped(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":false,"error":{"code":"unsupported","message":"LED is not configured"}}\n',
+                '{"id":3,"ok":false,"error":{"code":"unsupported","message":"buzzer is not configured"}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.led.buzzer.unsupported"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        with self.assertRaises(UnsupportedHardwareError):
+            service.set_led(True)
+        with self.assertRaises(UnsupportedHardwareError):
+            service.play_buzzer(2000)
+
         service.close()
 
     def test_requested_port_failure_raises_original_error(self) -> None:

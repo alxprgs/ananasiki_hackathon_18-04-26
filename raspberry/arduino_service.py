@@ -19,7 +19,7 @@ from datetime import datetime
 from html import escape
 from itertools import count
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Sequence
 
 try:
     import serial  # type: ignore[import-not-found]
@@ -48,6 +48,8 @@ URM37_COMPARE_DISTANCE_MIN_CM = 0
 URM37_COMPARE_DISTANCE_MAX_CM = 1000
 URM37_SENSITIVITY_MIN = 10
 URM37_SENSITIVITY_MAX = 200
+BUZZER_FREQUENCY_MIN_HZ = 31
+BUZZER_FREQUENCY_MAX_HZ = 10000
 
 
 class ArduinoServiceError(RuntimeError):
@@ -112,6 +114,29 @@ def _validate_urm37_sensitivity(value: int) -> int:
         raise ValueError(
             f"sensitivity должен быть в диапазоне от {URM37_SENSITIVITY_MIN} до {URM37_SENSITIVITY_MAX}"
         )
+    return normalized_value
+
+
+def _validate_buzzer_frequency_hz(value: float) -> int:
+    normalized_value = int(round(float(value)))
+    if not BUZZER_FREQUENCY_MIN_HZ <= normalized_value <= BUZZER_FREQUENCY_MAX_HZ:
+        raise ValueError(
+            f"frequency_hz должен быть в диапазоне от {BUZZER_FREQUENCY_MIN_HZ} до {BUZZER_FREQUENCY_MAX_HZ}"
+        )
+    return normalized_value
+
+
+def _validate_buzzer_duration_ms(value: int, *, field_name: str = "duration_ms") -> int:
+    normalized_value = int(value)
+    if normalized_value <= 0:
+        raise ValueError(f"{field_name} должен быть больше нуля")
+    return normalized_value
+
+
+def _validate_buzzer_repeat(value: int) -> int:
+    normalized_value = int(value)
+    if normalized_value <= 0:
+        raise ValueError("repeat должен быть больше нуля")
     return normalized_value
 
 
@@ -197,6 +222,17 @@ class Urm37Settings:
     auto_measure_interval_ms: int
     compare_distance_cm: int
     sensitivity: int
+
+
+@dataclass(slots=True, frozen=True)
+class BuzzerStep:
+    frequency_hz: int | None
+    duration_ms: int
+
+    def __post_init__(self) -> None:
+        if self.frequency_hz is not None:
+            object.__setattr__(self, "frequency_hz", _validate_buzzer_frequency_hz(self.frequency_hz))
+        object.__setattr__(self, "duration_ms", _validate_buzzer_duration_ms(self.duration_ms))
 
 
 @dataclass(slots=True)
@@ -352,6 +388,8 @@ class ArduinoService:
         self.eng_r = MotorChannel(self, "right")
         self.servo = ServoController(self)
         self.relay = RelayController(self)
+        self.led = LedController(self)
+        self.buzzer = BuzzerController(self)
         self.stepper = StepperController(self)
 
     def _connect(self, requested_port: str | None, baudrate: int) -> str:
@@ -805,6 +843,102 @@ class ArduinoService:
             error_text=lambda exc: f"Не удалось {'включить' if relay_enabled else 'выключить'} реле: {exc}",
             route_label="Реле вкл" if relay_enabled else "Реле выкл",
         )
+
+    def set_led(self, enabled: bool) -> dict[str, Any]:
+        """Переключает LED в состояние включено/выключено."""
+
+        led_enabled = bool(enabled)
+        return self._run_logged_action(
+            category="actuator",
+            action="set_led",
+            params={"enabled": led_enabled},
+            protocol_op="set_led",
+            operation=lambda: self._send_set_led(led_enabled),
+            success_text=lambda _: f"LED {'включён' if led_enabled else 'выключен'} — Выполнено",
+            error_text=lambda exc: f"Не удалось {'включить' if led_enabled else 'выключить'} LED: {exc}",
+            route_label="LED вкл" if led_enabled else "LED выкл",
+        )
+
+    def play_buzzer(self, frequency_hz: float, duration_ms: int | None = None) -> dict[str, Any]:
+        """Запускает зуммер на указанной частоте."""
+
+        normalized_frequency_hz = _validate_buzzer_frequency_hz(frequency_hz)
+        normalized_duration_ms = (
+            _validate_buzzer_duration_ms(duration_ms) if duration_ms is not None else None
+        )
+        params: dict[str, Any] = {"frequency_hz": normalized_frequency_hz}
+        if normalized_duration_ms is not None:
+            params["duration_ms"] = normalized_duration_ms
+        return self._run_logged_action(
+            category="actuator",
+            action="play_buzzer",
+            params=params,
+            protocol_op="buzzer_play",
+            operation=lambda: self._send_buzzer_play(
+                normalized_frequency_hz,
+                duration_ms=normalized_duration_ms,
+            ),
+            success_text=lambda _: (
+                f"Зуммер запущен на частоте {normalized_frequency_hz} Гц"
+                + (
+                    f" на {normalized_duration_ms / 1000.0:.2f} с — Выполнено"
+                    if normalized_duration_ms is not None
+                    else " — Выполнено"
+                )
+            ),
+            error_text=lambda exc: f"Не удалось запустить зуммер на частоте {normalized_frequency_hz} Гц: {exc}",
+            route_label=f"Зуммер {normalized_frequency_hz} Гц",
+        )
+
+    def stop_buzzer(self) -> dict[str, Any]:
+        """Останавливает зуммер."""
+
+        return self._run_logged_action(
+            category="actuator",
+            action="stop_buzzer",
+            params={},
+            protocol_op="buzzer_stop",
+            operation=self._send_buzzer_stop,
+            success_text=lambda _: "Зуммер остановлен — Выполнено",
+            error_text=lambda exc: f"Не удалось остановить зуммер: {exc}",
+            route_label="Зуммер стоп",
+        )
+
+    def _send_set_led(self, enabled: bool) -> dict[str, Any]:
+        return self._send_request("set_led", {"enabled": bool(enabled)})
+
+    def _send_buzzer_play(self, frequency_hz: int, *, duration_ms: int | None = None) -> dict[str, Any]:
+        args: dict[str, Any] = {"frequency_hz": int(frequency_hz)}
+        if duration_ms is not None:
+            args["duration_ms"] = int(duration_ms)
+        return self._send_request("buzzer_play", args)
+
+    def _send_buzzer_stop(self) -> dict[str, Any]:
+        return self._send_request("buzzer_stop")
+
+    def _play_buzzer_sequence(self, steps: Sequence[BuzzerStep], *, repeat: int = 1) -> dict[str, Any]:
+        normalized_repeat = _validate_buzzer_repeat(repeat)
+        normalized_steps = [BuzzerStep(step.frequency_hz, step.duration_ms) for step in steps]
+        if not normalized_steps:
+            raise ValueError("steps не должен быть пустым")
+
+        total_duration_ms = 0
+        for _ in range(normalized_repeat):
+            for step in normalized_steps:
+                total_duration_ms += step.duration_ms
+                if step.frequency_hz is None:
+                    self._send_buzzer_stop()
+                    self._wait_for_timed_completion(step.duration_ms)
+                    continue
+                self._send_buzzer_play(step.frequency_hz, duration_ms=step.duration_ms)
+                self._wait_for_timed_completion(step.duration_ms)
+
+        self._send_buzzer_stop()
+        return {
+            "repeat": normalized_repeat,
+            "steps": [asdict(step) for step in normalized_steps],
+            "total_duration_ms": total_duration_ms,
+        }
 
     def move_stepper(
         self,
@@ -2374,6 +2508,111 @@ class RelayController:
             Словарь ``data`` с итоговым состоянием реле.
         """
         return self._service.set_relay(enabled)
+
+
+class LedController:
+    """Удобный фасад для включения и выключения LED."""
+
+    def __init__(self, service: ArduinoService) -> None:
+        self._service = service
+
+    def on(self) -> dict[str, Any]:
+        return self._service.set_led(True)
+
+    def off(self) -> dict[str, Any]:
+        return self._service.set_led(False)
+
+    def set(self, enabled: bool) -> dict[str, Any]:
+        return self._service.set_led(enabled)
+
+
+class BuzzerController:
+    """High-level фасад для управления пассивным piezo buzzer."""
+
+    def __init__(self, service: ArduinoService) -> None:
+        self._service = service
+
+    def on(self, frequency_hz: float = 2000) -> dict[str, Any]:
+        return self._service.play_buzzer(frequency_hz)
+
+    def off(self) -> dict[str, Any]:
+        return self._service.stop_buzzer()
+
+    def tone(self, frequency_hz: float, duration: float | None = None) -> dict[str, Any]:
+        duration_ms = _seconds_to_ms(duration) if duration is not None else None
+        response = self._service.play_buzzer(frequency_hz, duration_ms=duration_ms)
+        if duration_ms is not None:
+            self._service._wait_for_timed_completion(duration_ms)
+        return response
+
+    def beep(
+        self,
+        *,
+        frequency_hz: float = 2000,
+        duration: float = 0.1,
+        pause: float = 0.0,
+        repeat: int = 1,
+    ) -> dict[str, Any]:
+        duration_ms = _seconds_to_ms(duration)
+        pause_seconds = float(pause)
+        if pause_seconds < 0:
+            raise ValueError("pause не может быть отрицательным")
+        steps = [BuzzerStep(frequency_hz=_validate_buzzer_frequency_hz(frequency_hz), duration_ms=duration_ms)]
+        if pause_seconds > 0:
+            steps.append(BuzzerStep(frequency_hz=None, duration_ms=_seconds_to_ms(pause_seconds)))
+        return self.play_sequence(steps, repeat=repeat)
+
+    def play_sequence(self, steps: Sequence[BuzzerStep], repeat: int = 1) -> dict[str, Any]:
+        normalized_repeat = _validate_buzzer_repeat(repeat)
+        normalized_steps = [BuzzerStep(step.frequency_hz, step.duration_ms) for step in steps]
+        if not normalized_steps:
+            raise ValueError("steps не должен быть пустым")
+        return self._service._run_logged_action(
+            category="actuator",
+            action="buzzer.play_sequence",
+            params={
+                "steps": [asdict(step) for step in normalized_steps],
+                "repeat": normalized_repeat,
+            },
+            protocol_op="buzzer_play",
+            operation=lambda: self._service._play_buzzer_sequence(
+                normalized_steps,
+                repeat=normalized_repeat,
+            ),
+            success_text=lambda result: (
+                f"Зуммер проиграл последовательность из {len(normalized_steps)} шагов "
+                f"({normalized_repeat}x) за {result['total_duration_ms'] / 1000.0:.2f} с — Выполнено"
+            ),
+            error_text=lambda exc: f"Не удалось проиграть последовательность зуммера: {exc}",
+            route_label="Зуммер последовательность",
+        )
+
+    def success(self) -> dict[str, Any]:
+        return self.play_sequence(
+            [
+                BuzzerStep(frequency_hz=1600, duration_ms=90),
+                BuzzerStep(frequency_hz=None, duration_ms=50),
+                BuzzerStep(frequency_hz=2200, duration_ms=140),
+            ]
+        )
+
+    def warning(self) -> dict[str, Any]:
+        return self.play_sequence(
+            [
+                BuzzerStep(frequency_hz=1800, duration_ms=120),
+                BuzzerStep(frequency_hz=None, duration_ms=70),
+                BuzzerStep(frequency_hz=1800, duration_ms=120),
+            ]
+        )
+
+    def error(self) -> dict[str, Any]:
+        return self.play_sequence(
+            [
+                BuzzerStep(frequency_hz=700, duration_ms=220),
+                BuzzerStep(frequency_hz=None, duration_ms=80),
+                BuzzerStep(frequency_hz=520, duration_ms=320),
+            ]
+        )
 
 
 class StepperController:
