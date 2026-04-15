@@ -31,6 +31,7 @@
 ## Дополнительная информация
 - Информация о питании компонентов - [Power Info](docs/power.md)
 - Информация о первоначальной настройке RPI - [RPI Setup](docs/RPI.md)
+- Регламент [Регламент RoboCupJunior Rescue Maze](docs/Регламент_Спасатели_в_лабиринте_RoboCupJunior_Rescue_Maze.pdf)
 
 ## Идея проекта
 
