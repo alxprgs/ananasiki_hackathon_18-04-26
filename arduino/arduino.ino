@@ -6,12 +6,14 @@
 #endif
 
 #ifndef SERVO_FEATURE_ENABLED
-#define SERVO_FEATURE_ENABLED 1
+#define SERVO_FEATURE_ENABLED 0
 #endif
 
 #include <SoftwareSerial.h>
 
+#if SERVO_FEATURE_ENABLED
 #include <Servo.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,7 +35,7 @@
  * Почему здесь почти нет блокирующих задержек:
  * - робот не должен "замирать" на чтении датчика или шаговика и переставать
  *   обрабатывать команды;
- * - поэтому датчики, timed-моторы и stepper обновляются малыми шагами в loop().
+ * - поэтому датчики и timed-моторы обновляются малыми шагами в loop().
  *
  * Что проверить в первую очередь, если прошивка "не работает":
  * 1. Совпадает ли SERIAL_BAUD с настройкой на Raspberry Pi.
@@ -42,7 +44,7 @@
  * 4. Не перепутаны ли левый и правый моторы.
  * 5. Не нужно ли инвертировать направление одного из моторов.
  * 6. Есть ли общая земля между всеми модулями.
- * 7. Хватает ли питания моторам, серве, ультразвуку и stepper driver.
+ * 7. Хватает ли питания моторам, серве и ультразвуку.
  */
 
 namespace Config {
@@ -56,7 +58,7 @@ namespace Config {
  *   если команды left/right физически попали на противоположные гусеницы.
  * - LEFT_TRACK_INVERTED / RIGHT_TRACK_INVERTED:
  *   если мотор при положительной команде едет не вперёд, а назад.
- * - SERVO_ENABLED / RELAY_ENABLED / STEPPER_ENABLED:
+ * - SERVO_ENABLED / RELAY_ENABLED / LED_ENABLED / BUZZER_ENABLED:
  *   позволяют быстро отключить опциональное оборудование, не ломая остальную
  *   прошивку.
  */
@@ -70,21 +72,14 @@ constexpr unsigned long URM37_TRIGGER_PULSE_US = 25UL;
 constexpr unsigned long URM37_ECHO_TIMEOUT_US = 50000UL;
 constexpr unsigned long URM37_SERIAL_BAUD = 9600UL;
 constexpr unsigned long URM37_SERIAL_TIMEOUT_MS = 120UL;
-constexpr unsigned long STEPPER_PULSE_HIGH_US = 10UL;
-constexpr long STEPPER_STEPS_PER_REV = 200L;
 constexpr bool SWAP_TRACK_MOTORS = false;
 constexpr bool LEFT_TRACK_INVERTED = false;
 constexpr bool RIGHT_TRACK_INVERTED = true;
 constexpr bool SERVO_ENABLED = SERVO_FEATURE_ENABLED != 0;
 constexpr bool RELAY_ENABLED = false;
-<<<<<<< Updated upstream
-constexpr bool STEPPER_ENABLED = false;
 constexpr bool LED_ENABLED = false;
 constexpr bool BUZZER_ENABLED = false;
-=======
-constexpr bool STEPPER_ENABLED = true;
->>>>>>> Stashed changes
-constexpr bool STEPPER_ENABLE_ACTIVE_LOW = true;
+constexpr uint8_t SERVO_COUNT = 2;
 constexpr uint8_t PIN_NOT_ASSIGNED = 0xFF;
 constexpr uint8_t DISTANCE_SENSOR_COUNT = 4;
 constexpr uint8_t URM37_DEFAULT_AUTO_INTERVAL_MS = 25;
@@ -99,10 +94,10 @@ constexpr uint8_t SENSOR2_TRIG_PIN = 8;
 constexpr uint8_t SENSOR2_ECHO_PIN = 9;
 constexpr uint8_t SENSOR1_SERIAL_RX_PIN = PIN_NOT_ASSIGNED;
 constexpr uint8_t SENSOR1_SERIAL_TX_PIN = PIN_NOT_ASSIGNED;
-constexpr uint8_t SERVO_PIN = 10;
+constexpr uint8_t SERVO1_PIN = 10;
 constexpr uint8_t RELAY_PIN = 11;
-constexpr uint8_t STEPPER_STEP_PIN = 12;
-constexpr uint8_t STEPPER_DIR_PIN = 13;
+constexpr uint8_t SERVO2_PIN = 12;
+constexpr uint8_t AUX_PIN = 13;
 constexpr uint8_t SENSOR2_SERIAL_RX_PIN = A2;
 constexpr uint8_t SENSOR2_SERIAL_TX_PIN = A3;
 constexpr uint8_t SENSOR3_TRIG_PIN = PIN_NOT_ASSIGNED;
@@ -113,7 +108,6 @@ constexpr uint8_t SENSOR4_TRIG_PIN = PIN_NOT_ASSIGNED;
 constexpr uint8_t SENSOR4_ECHO_PIN = PIN_NOT_ASSIGNED;
 constexpr uint8_t SENSOR4_SERIAL_RX_PIN = PIN_NOT_ASSIGNED;
 constexpr uint8_t SENSOR4_SERIAL_TX_PIN = PIN_NOT_ASSIGNED;
-constexpr uint8_t STEPPER_ENABLE_PIN = A0;
 constexpr uint8_t BUTTON_PIN = A1;
 constexpr uint8_t LED_PIN = A4;
 constexpr uint8_t BUZZER_PIN = A5;
@@ -198,26 +192,6 @@ struct MotorRuntimeState {
   int rampStopPercent;
   unsigned long rampStartedAtMs;
   unsigned long rampDurationMs;
-};
-
-/*
- * Состояние stepper driver.
- *
- * Здесь мы отслеживаем не только факт "крутится / не крутится", но и:
- * - ограничение по шагам;
- * - ограничение по времени;
- * - состояние STEP-пина;
- * - интервал между шагами.
- */
-struct StepperRuntimeState {
-  bool running;
-  bool stepPinHigh;
-  bool hasDeadline;
-  bool hasStepLimit;
-  long stepsRemaining;
-  unsigned long stopAtMs;
-  unsigned long lastPulseUs;
-  unsigned long stepIntervalUs;
 };
 
 struct BuzzerRuntimeState {
@@ -317,12 +291,10 @@ int gNextSensorIndex = 0;
 MotorRuntimeState gLeftMotor = {0, false, 0, false, 0, 0, 0, 0};
 MotorRuntimeState gRightMotor = {0, false, 0, false, 0, 0, 0, 0};
 
-StepperRuntimeState gStepper = {false, false, false, false, 0, 0, 0, 0};
-
 #if SERVO_FEATURE_ENABLED
-Servo gServo;
-bool gServoAttached = false;
-int gServoAngle = 90;
+Servo gServos[Config::SERVO_COUNT];
+bool gServoAttached[Config::SERVO_COUNT] = {false, false};
+int gServoAngles[Config::SERVO_COUNT] = {90, 90};
 #endif
 bool gRelayEnabled = false;
 bool gLedEnabled = false;
@@ -389,9 +361,6 @@ bool isBaseHardwarePin(uint8_t pin) {
       pin == Config::RIGHT_DIR_PIN || pin == Config::BUTTON_PIN) {
     return true;
   }
-  if (Config::SERVO_ENABLED && pin == Config::SERVO_PIN) {
-    return true;
-  }
   if (Config::RELAY_ENABLED && pin == Config::RELAY_PIN) {
     return true;
   }
@@ -401,8 +370,7 @@ bool isBaseHardwarePin(uint8_t pin) {
   if (Config::BUZZER_ENABLED && pin == Config::BUZZER_PIN) {
     return true;
   }
-  if (Config::STEPPER_ENABLED &&
-      (pin == Config::STEPPER_STEP_PIN || pin == Config::STEPPER_DIR_PIN || pin == Config::STEPPER_ENABLE_PIN)) {
+  if (Config::SERVO_ENABLED && (pin == Config::SERVO1_PIN || pin == Config::SERVO2_PIN)) {
     return true;
   }
   return false;
@@ -915,7 +883,19 @@ void applyMotorOutput(const MotorPins& pins, int percent) {
   analogWrite(pins.pwmPin, pwmToDutyCycle(boundedPercent));
 }
 
-void stopStepper();
+uint8_t servoPinForIndex(int servoIndex) {
+  return servoIndex == 0 ? Config::SERVO1_PIN : Config::SERVO2_PIN;
+}
+
+#if SERVO_FEATURE_ENABLED
+void ensureServoAttached(int servoIndex) {
+  if (servoIndex < 0 || servoIndex >= Config::SERVO_COUNT || gServoAttached[servoIndex]) {
+    return;
+  }
+  gServos[servoIndex].attach(servoPinForIndex(servoIndex));
+  gServoAttached[servoIndex] = true;
+}
+#endif
 
 void stopBuzzer() {
   if (!Config::BUZZER_ENABLED) {
@@ -953,7 +933,6 @@ void stopAllMotion() {
   gRightMotor.rampDurationMs = 0;
   applyMotorOutput(leftMotorPins(), 0);
   applyMotorOutput(rightMotorPins(), 0);
-  stopStepper();
 }
 
 // Запоминаем новое состояние моторного канала и сразу применяем его к железу.
@@ -1075,11 +1054,6 @@ void updateMotorTimers() {
       stoppedUnsafeMotion = true;
     }
 
-    if (gStepper.running && !gStepper.hasDeadline && !gStepper.hasStepLimit) {
-      stopStepper();
-      stoppedUnsafeMotion = true;
-    }
-
     if (stoppedUnsafeMotion) {
       gWatchdogTriggered = true;
     }
@@ -1093,112 +1067,6 @@ void updateBuzzer() {
 
   if (hasElapsed(millis(), gBuzzer.stopAtMs)) {
     stopBuzzer();
-  }
-}
-
-// Унифицированное управление линией ENABLE у stepper driver.
-void enableStepperDriver(bool enabled) {
-  if (!Config::STEPPER_ENABLED) {
-    return;
-  }
-
-  bool outputState = enabled;
-  if (Config::STEPPER_ENABLE_ACTIVE_LOW) {
-    outputState = !enabled;
-  }
-  digitalWrite(Config::STEPPER_ENABLE_PIN, outputState ? HIGH : LOW);
-}
-
-// Безопасная остановка шагового двигателя и перевод драйвера в покой.
-void stopStepper() {
-  if (!Config::STEPPER_ENABLED) {
-    return;
-  }
-
-  gStepper.running = false;
-  gStepper.stepPinHigh = false;
-  gStepper.hasDeadline = false;
-  gStepper.hasStepLimit = false;
-  gStepper.stepsRemaining = 0;
-  digitalWrite(Config::STEPPER_STEP_PIN, LOW);
-  enableStepperDriver(false);
-}
-
-/*
- * Подготовка stepper driver к работе.
- *
- * Если шаговик дёргается, но не крутится стабильно, обычно проблема одна из этих:
- * - слишком большой rpm;
- * - перепутаны STEP/DIR;
- * - неверная логика ENABLE;
- * - недостаток питания драйвера или мотора.
- */
-void startStepper(bool forward, unsigned long rpm, long steps, long durationMs) {
-  if (!Config::STEPPER_ENABLED) {
-    return;
-  }
-
-  enableStepperDriver(true);
-  digitalWrite(Config::STEPPER_DIR_PIN, forward ? HIGH : LOW);
-
-  unsigned long intervalUs = 60000000UL / (static_cast<unsigned long>(Config::STEPPER_STEPS_PER_REV) * rpm);
-  if (intervalUs < Config::STEPPER_PULSE_HIGH_US + 20UL) {
-    intervalUs = Config::STEPPER_PULSE_HIGH_US + 20UL;
-  }
-
-  gStepper.running = true;
-  gStepper.stepPinHigh = false;
-  gStepper.stepIntervalUs = intervalUs;
-  gStepper.lastPulseUs = micros();
-  gStepper.hasDeadline = durationMs > 0;
-  gStepper.stopAtMs = millis() + static_cast<unsigned long>(durationMs > 0 ? durationMs : 0);
-  gStepper.hasStepLimit = steps > 0;
-  gStepper.stepsRemaining = steps > 0 ? steps : 0;
-}
-
-/*
- * Неблокирующее "тикание" шаговика.
- *
- * STEP поднимается и опускается как отдельные фазы, чтобы импульс имел нужную
- * длительность и не ломал тайминг драйвера.
- */
-void updateStepper() {
-  if (!Config::STEPPER_ENABLED || !gStepper.running) {
-    return;
-  }
-
-  unsigned long nowMs = millis();
-  unsigned long nowUs = micros();
-
-  if (gStepper.hasDeadline && hasElapsed(nowMs, gStepper.stopAtMs)) {
-    stopStepper();
-    return;
-  }
-
-  if (gStepper.stepPinHigh) {
-    if (hasElapsed(nowUs, gStepper.lastPulseUs + Config::STEPPER_PULSE_HIGH_US)) {
-      digitalWrite(Config::STEPPER_STEP_PIN, LOW);
-      gStepper.stepPinHigh = false;
-      gStepper.lastPulseUs = nowUs;
-      if (gStepper.hasStepLimit && gStepper.stepsRemaining <= 0) {
-        stopStepper();
-      }
-    }
-    return;
-  }
-
-  if (gStepper.hasStepLimit && gStepper.stepsRemaining <= 0) {
-    stopStepper();
-    return;
-  }
-
-  if (hasElapsed(nowUs, gStepper.lastPulseUs + gStepper.stepIntervalUs)) {
-    digitalWrite(Config::STEPPER_STEP_PIN, HIGH);
-    gStepper.stepPinHigh = true;
-    gStepper.lastPulseUs = nowUs;
-    if (gStepper.hasStepLimit && gStepper.stepsRemaining > 0) {
-      --gStepper.stepsRemaining;
-    }
   }
 }
 
@@ -1325,6 +1193,19 @@ bool extractSensorIndex(long requestId, const char* payload, int& sensorIndex) {
   return true;
 }
 
+bool extractServoIndex(long requestId, const char* payload, int& servoIndex) {
+  long servoId = 1;
+  if (!extractLongField(payload, PSTR("servo_id"), servoId)) {
+    extractLongField(payload, PSTR("servo"), servoId);
+  }
+  if (servoId < 1 || servoId > static_cast<long>(Config::SERVO_COUNT)) {
+    sendErrorResponse(requestId, F("bad_request"), F("servo_id must be in range 1..2"));
+    return false;
+  }
+  servoIndex = static_cast<int>(servoId) - 1;
+  return true;
+}
+
 bool ensureUrm37SerialCommandSupported(long requestId, const DistanceSensorState& sensor) {
   if (!sensor.enabled || sensor.kind == DISTANCE_SENSOR_DISABLED || !sensorHasDistancePins(sensor)) {
     sendErrorResponse(requestId, F("not_configured"), F("distance sensor slot is disabled"));
@@ -1392,8 +1273,6 @@ void sendStatusResponse(long requestId) {
   } else {
     Serial.print(F("null"));
   }
-  Serial.print(F(",\"stepper_running\":"));
-  printBool(gStepper.running);
   Serial.print(F(",\"features\":{\"servo\":"));
   printBool(Config::SERVO_ENABLED);
   Serial.print(F(",\"relay\":"));
@@ -1402,8 +1281,6 @@ void sendStatusResponse(long requestId) {
   printBool(Config::LED_ENABLED);
   Serial.print(F(",\"buzzer\":"));
   printBool(Config::BUZZER_ENABLED);
-  Serial.print(F(",\"stepper\":"));
-  printBool(Config::STEPPER_ENABLED);
   Serial.print(F("},\"distance_mm\":{"));
   for (uint8_t sensorIndex = 0; sensorIndex < Config::DISTANCE_SENSOR_COUNT; ++sensorIndex) {
     long distanceMm = 0;
@@ -1711,6 +1588,11 @@ void handleSetServo(long requestId, const char* payload) {
     return;
   }
 
+  int servoIndex = 0;
+  if (!extractServoIndex(requestId, payload, servoIndex)) {
+    return;
+  }
+
   long angle = 0;
   if (!extractLongField(payload, PSTR("angle_deg"), angle)) {
     sendErrorResponse(requestId, "bad_request", "поле angle_deg обязательно");
@@ -1723,18 +1605,17 @@ void handleSetServo(long requestId, const char* payload) {
     angle = 180;
   }
 
-  if (!gServoAttached) {
-    gServo.attach(Config::SERVO_PIN);
-    gServoAttached = true;
-  }
+  ensureServoAttached(servoIndex);
 
-  gServoAngle = static_cast<int>(angle);
-  gServo.write(gServoAngle);
+  gServoAngles[servoIndex] = static_cast<int>(angle);
+  gServos[servoIndex].write(gServoAngles[servoIndex]);
 
   Serial.print(F("{\"id\":"));
   Serial.print(requestId);
-  Serial.print(F(",\"ok\":true,\"data\":{\"angle_deg\":"));
-  Serial.print(gServoAngle);
+  Serial.print(F(",\"ok\":true,\"data\":{\"servo_id\":"));
+  Serial.print(servoIndex + 1);
+  Serial.print(F(",\"angle_deg\":"));
+  Serial.print(gServoAngles[servoIndex]);
   Serial.println(F("}}"));
 #endif
 }
@@ -1852,6 +1733,7 @@ void handleBuzzerStop(long requestId) {
  * Если steps отрицательный, логика специально разворачивает направление:
  * это позволяет вызывать команду более гибко с Raspberry Pi.
  */
+#if 0
 void handleStepperMove(long requestId, const char* payload) {
   if (!Config::STEPPER_ENABLED) {
     sendErrorResponse(requestId, F("unsupported"), "шаговый двигатель не настроен");
@@ -1914,6 +1796,7 @@ void handleStepperMove(long requestId, const char* payload) {
   Serial.print(durationMs);
   Serial.println(F("}}"));
 }
+#endif
 
 /*
  * Центральный диспетчер протокола.
@@ -2010,6 +1893,7 @@ void handleRequest(const char* payload) {
     return;
   }
 
+  #if 0
   if (equalsFlash(operation, PSTR("stepper_move"))) {
     handleStepperMove(requestId, payload);
     return;
@@ -2024,6 +1908,7 @@ void handleRequest(const char* payload) {
     sendEmptyOkResponse(requestId);
     return;
   }
+  #endif
 
   sendErrorResponse(requestId, F("unknown_op"), "операция не поддерживается");
 }
@@ -2077,7 +1962,7 @@ void readSerialRequests() {
  * - верна ли распиновка в Config;
  * - на тех ли пинах сидят trig/echo;
  * - не перепутаны ли dir/pwm у моторов;
- * - не наоборот ли логика enable у stepper driver.
+ * - нет ли конфликта пинов у опциональных модулей.
  */
 void setupPins() {
   pinMode(leftMotorPins().dirPin, OUTPUT);
@@ -2109,9 +1994,10 @@ void setupPins() {
 
   #if SERVO_FEATURE_ENABLED
   if (Config::SERVO_ENABLED) {
-    gServo.attach(Config::SERVO_PIN);
-    gServo.write(gServoAngle);
-    gServoAttached = true;
+    for (uint8_t servoIndex = 0; servoIndex < Config::SERVO_COUNT; ++servoIndex) {
+      ensureServoAttached(servoIndex);
+      gServos[servoIndex].write(gServoAngles[servoIndex]);
+    }
   }
   #endif
 
@@ -2132,15 +2018,6 @@ void setupPins() {
     digitalWrite(Config::BUZZER_PIN, LOW);
   }
   stopBuzzer();
-
-  if (Config::STEPPER_ENABLED) {
-    pinMode(Config::STEPPER_STEP_PIN, OUTPUT);
-    pinMode(Config::STEPPER_DIR_PIN, OUTPUT);
-    pinMode(Config::STEPPER_ENABLE_PIN, OUTPUT);
-    digitalWrite(Config::STEPPER_STEP_PIN, LOW);
-    digitalWrite(Config::STEPPER_DIR_PIN, LOW);
-    enableStepperDriver(false);
-  }
 }
 
 // setup() выполняется один раз после старта Arduino.
@@ -2166,5 +2043,4 @@ void loop() {
   updateSensors();
   updateMotorTimers();
   updateBuzzer();
-  updateStepper();
 }

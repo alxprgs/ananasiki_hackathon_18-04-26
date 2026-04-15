@@ -40,6 +40,8 @@ RotationDirection = Literal["left", "right"]
 DistanceSensorKind = Literal["disabled", "hc_sr04", "urm37"]
 Urm37MeasureMode = Literal["pwm_passive", "auto"]
 
+MIN_SERVO_ID = 1
+MAX_SERVO_ID = 2
 MIN_DISTANCE_SENSOR_ID = 1
 MAX_DISTANCE_SENSOR_ID = 4
 URM37_AUTO_INTERVAL_MIN_MS = 25
@@ -74,6 +76,13 @@ class UnsupportedHardwareError(ArduinoProtocolError):
 
 class SerialTimeoutError(ArduinoProtocolError):
     """Выбрасывается, когда Arduino не отвечает в пределах заданного таймаута."""
+
+
+def _validate_servo_id(servo_id: int, *, field_name: str = "servo_id") -> int:
+    normalized_servo_id = int(servo_id)
+    if not MIN_SERVO_ID <= normalized_servo_id <= MAX_SERVO_ID:
+        raise ValueError(f"{field_name} должен быть в диапазоне от {MIN_SERVO_ID} до {MAX_SERVO_ID}")
+    return normalized_servo_id
 
 
 def _validate_sensor_id(sensor_id: int, *, field_name: str = "sensor_id") -> int:
@@ -180,14 +189,6 @@ def _convert_distance(distance_mm: float, unit: UnitName) -> float:
     if unit == "m":
         return distance_mm / 1000.0
     raise ValueError(f"Неподдерживаемая единица измерения: {unit}")
-
-
-@dataclass(slots=True)
-class _StepperMoveOptions:
-    direction: Literal["forward", "reverse"] = "forward"
-    rpm: float = 60.0
-    steps: int | None = None
-    duration_ms: int | None = None
 
 
 @dataclass(slots=True)
@@ -321,10 +322,10 @@ class ArduinoService:
     - чтения расстояния с ультразвуковых датчиков;
     - чтения состояния кнопки;
     - управления моторами гусениц;
-    - управления сервоприводом, реле и шаговым двигателем.
+    - управления сервоприводами и реле.
 
     Публичные атрибуты ``distance_sensor``, ``eng_all``, ``eng_l``, ``eng_r``,
-    ``servo``, ``relay`` и ``stepper`` являются частью рабочего API и
+    ``servo``, ``servo2`` и ``relay`` являются частью рабочего API и
     используются как удобные фасады поверх базового serial-протокола.
     """
 
@@ -386,11 +387,11 @@ class ArduinoService:
         self.eng_all = MotorChannel(self, "all")
         self.eng_l = MotorChannel(self, "left")
         self.eng_r = MotorChannel(self, "right")
-        self.servo = ServoController(self)
+        self.servo = ServoController(self, servo_id=1)
+        self.servo2 = ServoController(self, servo_id=2)
         self.relay = RelayController(self)
         self.led = LedController(self)
         self.buzzer = BuzzerController(self)
-        self.stepper = StepperController(self)
 
     def _connect(self, requested_port: str | None, baudrate: int) -> str:
         if requested_port is not None:
@@ -790,12 +791,13 @@ class ArduinoService:
             ),
         )
 
-    def set_servo(self, angle_deg: float) -> dict[str, Any]:
+    def set_servo(self, angle_deg: float, servo_id: int = 1) -> dict[str, Any]:
         """Устанавливает угол сервопривода в градусах.
 
         Args:
             angle_deg: Целевой угол. На стороне Arduino значение будет
                 ограничено диапазоном ``0..180``.
+            servo_id: Номер сервопривода. Поддерживаются каналы ``1`` и ``2``.
 
         Returns:
             Словарь ``data`` с фактическим установленным углом.
@@ -806,17 +808,23 @@ class ArduinoService:
             ArduinoProtocolError: Если команда отклонена прошивкой.
         """
         target_angle = int(round(angle_deg))
+        target_servo_id = _validate_servo_id(servo_id)
         return self._run_logged_action(
             category="actuator",
             action="set_servo",
-            params={"angle_deg": target_angle},
+            params={"angle_deg": target_angle, "servo_id": target_servo_id},
             protocol_op="set_servo",
-            operation=lambda: self._send_request("set_servo", {"angle_deg": target_angle}),
-            success_text=lambda result: (
-                f"Сервопривод установлен на угол {result.get('angle_deg', target_angle)}° — Выполнено"
+            operation=lambda: self._send_request(
+                "set_servo",
+                {"angle_deg": target_angle, "servo_id": target_servo_id},
             ),
-            error_text=lambda exc: f"Не удалось установить сервопривод на угол {target_angle}°: {exc}",
-            route_label=f"Серво {target_angle}°",
+            success_text=lambda result: (
+                f"Сервопривод {target_servo_id} установлен на угол {result.get('angle_deg', target_angle)}° — Выполнено"
+            ),
+            error_text=lambda exc: (
+                f"Не удалось установить сервопривод {target_servo_id} на угол {target_angle}°: {exc}"
+            ),
+            route_label=f"Серво {target_servo_id}: {target_angle}°",
         )
 
     def set_relay(self, enabled: bool) -> dict[str, Any]:
@@ -939,86 +947,6 @@ class ArduinoService:
             "steps": [asdict(step) for step in normalized_steps],
             "total_duration_ms": total_duration_ms,
         }
-
-    def move_stepper(
-        self,
-        *,
-        steps: int | None = None,
-        rpm: float = 60.0,
-        direction: Literal["forward", "reverse"] = "forward",
-        duration_ms: int | None = None,
-    ) -> dict[str, Any]:
-        """Запускает шаговый двигатель с заданными параметрами.
-
-        Args:
-            steps: Количество шагов. Если ``None``, двигатель работает без
-                ограничения по шагам до отдельной остановки или истечения
-                ``duration_ms``.
-            rpm: Целевая скорость в оборотах в минуту.
-            direction: Направление ``forward`` или ``reverse``.
-            duration_ms: Ограничение времени работы в миллисекундах.
-
-        Returns:
-            Словарь ``data`` с подтверждением запуска и параметрами движения.
-
-        Raises:
-            UnsupportedHardwareError: Если шаговый двигатель отключён.
-            ArduinoProtocolError: Если команда отклонена прошивкой.
-        """
-        options = _StepperMoveOptions(
-            steps=steps,
-            rpm=rpm,
-            direction=direction,
-            duration_ms=duration_ms,
-        )
-        args: dict[str, Any] = {
-            "rpm": float(options.rpm),
-            "direction": options.direction,
-        }
-        if options.steps is not None:
-            args["steps"] = int(options.steps)
-        if options.duration_ms is not None:
-            args["duration_ms"] = int(options.duration_ms)
-        duration_text = (
-            f", ограничение {options.duration_ms / 1000.0:.2f} с"
-            if options.duration_ms is not None
-            else ""
-        )
-        steps_text = f", {options.steps} шагов" if options.steps is not None else ", без ограничения по шагам"
-        return self._run_logged_action(
-            category="actuator",
-            action="move_stepper",
-            params=args,
-            protocol_op="stepper_move",
-            operation=lambda: self._send_request("stepper_move", args),
-            success_text=lambda _: (
-                f"Шаговый двигатель запущен в направлении {options.direction} "
-                f"со скоростью {float(options.rpm):.1f} об/мин{steps_text}{duration_text} — Выполнено"
-            ),
-            error_text=lambda exc: f"Не удалось запустить шаговый двигатель: {exc}",
-            route_label="Шаговый двигатель",
-        )
-
-    def stop_stepper(self) -> dict[str, Any]:
-        """Останавливает шаговый двигатель.
-
-        Returns:
-            Словарь ``data`` из ответа Arduino.
-
-        Raises:
-            UnsupportedHardwareError: Если шаговый двигатель не поддерживается.
-            ArduinoProtocolError: Если команда завершилась ошибкой.
-        """
-        return self._run_logged_action(
-            category="actuator",
-            action="stop_stepper",
-            params={},
-            protocol_op="stepper_stop",
-            operation=lambda: self._send_request("stepper_stop"),
-            success_text=lambda _: "Шаговый двигатель остановлен — Выполнено",
-            error_text=lambda exc: f"Не удалось остановить шаговый двигатель: {exc}",
-            route_label="Шаговый стоп",
-        )
 
     def _get_distance_sensor_info(self, sensor_id: int) -> DistanceSensorInfo:
         normalized_sensor_id = _validate_sensor_id(sensor_id)
@@ -2469,8 +2397,9 @@ class MotorRampCommandBuilder:
 class ServoController:
     """Удобный фасад для команд управления сервоприводом."""
 
-    def __init__(self, service: ArduinoService) -> None:
+    def __init__(self, service: ArduinoService, *, servo_id: int) -> None:
         self._service = service
+        self._servo_id = _validate_servo_id(servo_id)
 
     def set(self, angle_deg: float) -> dict[str, Any]:
         """Устанавливает угол сервопривода.
@@ -2481,7 +2410,7 @@ class ServoController:
         Returns:
             Словарь ``data`` с подтверждённым углом.
         """
-        return self._service.set_servo(angle_deg)
+        return self._service.set_servo(angle_deg, servo_id=self._servo_id)
 
 
 class RelayController:
@@ -2613,45 +2542,3 @@ class BuzzerController:
                 BuzzerStep(frequency_hz=520, duration_ms=320),
             ]
         )
-
-
-class StepperController:
-    """Удобный фасад для команд управления шаговым двигателем."""
-
-    def __init__(self, service: ArduinoService) -> None:
-        self._service = service
-
-    def move(
-        self,
-        *,
-        steps: int | None = None,
-        rpm: float = 60.0,
-        direction: Literal["forward", "reverse"] = "forward",
-        duration: float | None = None,
-    ) -> dict[str, Any]:
-        """Запускает шаговый двигатель через high-level Python API.
-
-        Args:
-            steps: Ограничение по числу шагов или ``None`` для непрерывной
-                работы.
-            rpm: Скорость в оборотах в минуту.
-            direction: Направление ``forward`` или ``reverse``.
-            duration: Ограничение по времени в секундах.
-
-        Returns:
-            Словарь ``data`` из ответа Arduino.
-        """
-        duration_ms = _seconds_to_ms(duration) if duration is not None else None
-        response = self._service.move_stepper(
-            steps=steps,
-            rpm=rpm,
-            direction=direction,
-            duration_ms=duration_ms,
-        )
-        if duration_ms is not None:
-            self._service._wait_for_timed_completion(duration_ms)
-        return response
-
-    def stop(self) -> dict[str, Any]:
-        """Останавливает шаговый двигатель и возвращает подтверждение Arduino."""
-        return self._service.stop_stepper()

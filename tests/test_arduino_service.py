@@ -377,6 +377,71 @@ class ArduinoServiceTests(unittest.TestCase):
         self.assertNotIn("ramp_duration_ms", payload["args"])
         service.close()
 
+    def test_servo_service_and_controllers_send_expected_payloads(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"servo_id":1,"angle_deg":45}}\n',
+                '{"id":3,"ok":true,"data":{"servo_id":2,"angle_deg":120}}\n',
+                '{"id":4,"ok":true,"data":{"servo_id":1,"angle_deg":10}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.servo"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        self.assertEqual(service.set_servo(45, servo_id=1)["servo_id"], 1)
+        self.assertEqual(service.servo2.set(120)["servo_id"], 2)
+        self.assertEqual(service.servo.set(10)["angle_deg"], 10)
+
+        payloads = [json.loads(raw) for raw in connection.writes[1:4]]
+        self.assertEqual([payload["op"] for payload in payloads], ["set_servo", "set_servo", "set_servo"])
+        self.assertEqual([payload["args"]["servo_id"] for payload in payloads], [1, 2, 1])
+        self.assertEqual([payload["args"]["angle_deg"] for payload in payloads], [45, 120, 10])
+        service.close()
+
+    def test_invalid_servo_id_is_rejected_before_serial_write(self) -> None:
+        connection = FakeSerial(['{"id":1,"ok":true,"data":{"pong":true}}\n'])
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.servo.validation"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        with self.assertRaises(ValueError):
+            service.set_servo(90, servo_id=3)
+
+        self.assertEqual(len(connection.writes), 1)
+        service.close()
+
+    def test_servo_unsupported_errors_are_mapped(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":false,"error":{"code":"unsupported","message":"servo is not configured"}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.servo.unsupported"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        with self.assertRaises(UnsupportedHardwareError):
+            service.servo2.set(90)
+
+        service.close()
+
     def test_led_service_and_controller_send_expected_payloads(self) -> None:
         connection = FakeSerial(
             [
