@@ -210,7 +210,7 @@ bool gRequestOverflow = false;
 DistanceSensorState gSensors[Config::DISTANCE_SENSOR_COUNT] = {
     {
         true,
-        DISTANCE_SENSOR_HC_SR04,
+        DISTANCE_SENSOR_URM37,
         Config::SENSOR1_TRIG_PIN,
         Config::SENSOR1_ECHO_PIN,
         Config::SENSOR1_SERIAL_RX_PIN,
