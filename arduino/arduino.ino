@@ -6,7 +6,7 @@
 #endif
 
 #ifndef SERVO_FEATURE_ENABLED
-#define SERVO_FEATURE_ENABLED 0
+#define SERVO_FEATURE_ENABLED 1
 #endif
 
 #include <SoftwareSerial.h>
