@@ -77,7 +77,7 @@ constexpr bool LEFT_TRACK_INVERTED = false;
 constexpr bool RIGHT_TRACK_INVERTED = true;
 constexpr bool SERVO_ENABLED = SERVO_FEATURE_ENABLED != 0;
 constexpr bool RELAY_ENABLED = false;
-constexpr bool LED_ENABLED = false;
+constexpr bool LED_ENABLED = true;
 constexpr bool BUZZER_ENABLED = false;
 constexpr uint8_t SERVO_COUNT = 2;
 constexpr uint8_t PIN_NOT_ASSIGNED = 0xFF;
