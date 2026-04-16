@@ -205,6 +205,7 @@ Python-слой разделён на два сервиса:
 - `get_urm37_settings`
 - `set_urm37_settings`
 - `get_button`
+- `get_line`
 - `set_motor`
 - `stop_all`
 - `set_servo`
@@ -218,6 +219,8 @@ Python-слой разделён на два сервиса:
 - `get_distance` теперь принимает `sensor` от `1` до `4`;
 - `get_status` сохраняет совместимое поле `distance_mm`, но теперь отдаёт его для слотов `1..4` и дополнительно включает подробный блок `distance_sensors`;
 - `distance_sensors` содержит `enabled`, `kind`, `pins`, `serial_settings_available` и последнее `distance_mm` для каждого слота;
+- `get_status` также включает блок `line_sensors` с цифровым датчиком линии `AMP-B018`;
+- `line_sensors` содержит `enabled`, `kind`, `pin`, сырой `signal` и логическое `detected` для каждого слота;
 - URM37-специфичные команды возвращают `unsupported`, если выбран не `URM37`, и `not_configured`, если у URM37 не заданы оба `serial_rx`/`serial_tx`.
 - `set_led`, `buzzer_play` и `buzzer_stop` тоже возвращают `unsupported`, если соответствующий optional-модуль выключен в конфиге прошивки.
 
@@ -235,6 +238,8 @@ with ArduinoService() as arduino:
     print(arduino.status())
     print(arduino.distance_sensor.get(1, unit="cm"))
     print(arduino.distance_sensor.info(2))
+    print(arduino.line_sensor.get())
+    print(arduino.line_sensor.info())
     print(arduino.button_status())
     print(arduino.align_parallel_to_wall(wall_side="right", tolerance_mm=8.0))
 
@@ -264,6 +269,9 @@ with ArduinoService() as arduino:
 - `distance_sensor.get_temperature(sensor_id)`
 - `distance_sensor.get_urm37_settings(sensor_id)`
 - `distance_sensor.configure_urm37(sensor_id, ...)`
+- `line_sensor.get(sensor_id=1)`
+- `line_sensor.signal(sensor_id=1)`
+- `line_sensor.info(sensor_id=1)`
 - `button_status()`
 - `align_parallel_to_wall(front_sensor_id=1, rear_sensor_id=2, wall_side="right", ...)`
 - `eng_all.pwm(percent).time(seconds)`
@@ -344,6 +352,7 @@ if reply.get("pong"):
 
 - словарь `data` с текущими полями состояния, которые отдаёт прошивка;
 - обычно это статус кнопки, текущие значения PWM, последние измеренные расстояния и другие служебные поля.
+- для `AMP-B018` поле `line_sensors["1"]` содержит `signal=0/1` и `detected`, где `detected=True` означает, что датчик видит черную линию или пустоту.
 
 Пример:
 
@@ -381,6 +390,38 @@ if arduino.button_status():
 - как локальный старт миссии;
 - как аварийный или пользовательский триггер;
 - для простого ручного режима.
+
+#### `line_sensor.get(sensor_id=1)`, `line_sensor.signal(sensor_id=1)` и `line_sensor.info(sensor_id=1)`
+
+Назначение:
+
+- читают цифровой датчик линии `AMP-B018`, подключённый к `D13 / AUX_PIN`;
+- `get()` возвращает готовый флаг обнаружения линии;
+- `signal()` возвращает сырой цифровой уровень `0` или `1`;
+- `info()` возвращает краткую конфигурацию и текущее состояние датчика из `status()`.
+
+Что возвращают:
+
+- `line_sensor.get()` — `True`, если датчик видит черную линию или пустоту;
+- `line_sensor.signal()` — `0` или `1`;
+- `line_sensor.info()` — `LineSensorInfo(sensor_id, enabled, kind, pin, signal, detected)`.
+
+Пример:
+
+```python
+if arduino.line_sensor.get():
+    print("Линия обнаружена")
+
+raw_signal = arduino.line_sensor.signal()
+info = arduino.line_sensor.info()
+```
+
+Важно:
+
+- в первой версии поддерживается один цифровой датчик линии;
+- слот `1` по умолчанию привязан к `D13 / AUX_PIN`;
+- runtime-переназначение пина не поддерживается;
+- `detected=True` соответствует цифровому уровню `1`.
 
 #### `distance_sensor.get(sensor_id, unit="mm")`
 

@@ -162,7 +162,7 @@ class ArduinoServiceTests(unittest.TestCase):
         connection = FakeSerial(
             [
                 '{"id":1,"ok":true,"data":{"pong":true}}\n',
-                '{"id":2,"ok":true,"data":{"led_enabled":true,"buzzer_playing":true,"buzzer_frequency_hz":2200,"distance_sensors":{"1":{"enabled":true,"kind":"hc_sr04","pins":{"trigger":2,"echo":3,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":345},"2":{"enabled":true,"kind":"urm37","pins":{"trigger":8,"echo":9,"serial_rx":10,"serial_tx":11},"serial_settings_available":true,"distance_mm":680},"3":{"enabled":false,"kind":"disabled","pins":{"trigger":null,"echo":null,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":null},"4":{"enabled":false,"kind":"disabled","pins":{"trigger":null,"echo":null,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":null}},"features":{"led":true,"buzzer":true}}}\n',
+                '{"id":2,"ok":true,"data":{"led_enabled":true,"buzzer_playing":true,"buzzer_frequency_hz":2200,"distance_sensors":{"1":{"enabled":true,"kind":"hc_sr04","pins":{"trigger":2,"echo":3,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":345},"2":{"enabled":true,"kind":"urm37","pins":{"trigger":8,"echo":9,"serial_rx":10,"serial_tx":11},"serial_settings_available":true,"distance_mm":680},"3":{"enabled":false,"kind":"disabled","pins":{"trigger":null,"echo":null,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":null},"4":{"enabled":false,"kind":"disabled","pins":{"trigger":null,"echo":null,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":null}},"line_sensors":{"1":{"enabled":true,"kind":"amp_b018","pin":13,"signal":1,"detected":true}},"features":{"led":true,"buzzer":true}}}\n',
             ]
         )
 
@@ -183,13 +183,15 @@ class ArduinoServiceTests(unittest.TestCase):
         self.assertEqual(payload["buzzer_frequency_hz"], 2200)
         self.assertTrue(payload["features"]["led"])
         self.assertTrue(payload["features"]["buzzer"])
+        self.assertTrue(payload["line_sensors"]["1"]["detected"])
+        self.assertEqual(payload["line_sensors"]["1"]["signal"], 1)
         service.close()
 
     def test_distance_sensor_info_reads_extended_status(self) -> None:
         connection = FakeSerial(
             [
                 '{"id":1,"ok":true,"data":{"pong":true}}\n',
-                '{"id":2,"ok":true,"data":{"distance_sensors":{"1":{"enabled":true,"kind":"hc_sr04","pins":{"trigger":2,"echo":3,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":340},"2":{"enabled":true,"kind":"urm37","pins":{"trigger":8,"echo":9,"serial_rx":10,"serial_tx":11},"serial_settings_available":true,"distance_mm":680},"3":{"enabled":false,"kind":"disabled","pins":{"trigger":null,"echo":null,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":null},"4":{"enabled":false,"kind":"disabled","pins":{"trigger":null,"echo":null,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":null}}}}\n',
+                '{"id":2,"ok":true,"data":{"distance_sensors":{"1":{"enabled":true,"kind":"hc_sr04","pins":{"trigger":2,"echo":3,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":340},"2":{"enabled":true,"kind":"urm37","pins":{"trigger":8,"echo":9,"serial_rx":10,"serial_tx":11},"serial_settings_available":true,"distance_mm":680},"3":{"enabled":false,"kind":"disabled","pins":{"trigger":null,"echo":null,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":null},"4":{"enabled":false,"kind":"disabled","pins":{"trigger":null,"echo":null,"serial_rx":null,"serial_tx":null},"serial_settings_available":false,"distance_mm":null}},"line_sensors":{"1":{"enabled":true,"kind":"amp_b018","pin":13,"signal":0,"detected":false}}}}\n',
             ]
         )
 
@@ -208,6 +210,39 @@ class ArduinoServiceTests(unittest.TestCase):
         self.assertEqual(info.serial_rx_pin, 10)
         self.assertTrue(info.serial_settings_available)
         self.assertAlmostEqual(info.distance_mm or 0.0, 680.0)
+        service.close()
+
+    def test_line_sensor_accessor_reads_detected_signal_and_info(self) -> None:
+        connection = FakeSerial(
+            [
+                '{"id":1,"ok":true,"data":{"pong":true}}\n',
+                '{"id":2,"ok":true,"data":{"sensor":1,"signal":1,"detected":true}}\n',
+                '{"id":3,"ok":true,"data":{"sensor":1,"signal":0,"detected":false}}\n',
+                '{"id":4,"ok":true,"data":{"line_sensors":{"1":{"enabled":true,"kind":"amp_b018","pin":13,"signal":1,"detected":true}}}}\n',
+            ]
+        )
+
+        service = ArduinoService(
+            port="COM1",
+            logger=logging.getLogger("test.line.api"),
+            retry_count=0,
+            serial_factory=lambda **kwargs: connection,
+            port_enumerator=lambda: [],
+        )
+
+        self.assertTrue(service.line_sensor.get(1))
+        self.assertEqual(service.line_sensor.signal(1), 0)
+        info = service.line_sensor.info(1)
+        self.assertEqual(info.sensor_id, 1)
+        self.assertTrue(info.enabled)
+        self.assertEqual(info.kind, "amp_b018")
+        self.assertEqual(info.pin, 13)
+        self.assertEqual(info.signal, 1)
+        self.assertTrue(info.detected)
+
+        payload = json.loads(connection.writes[1])
+        self.assertEqual(payload["op"], "get_line")
+        self.assertEqual(payload["args"]["sensor"], 1)
         service.close()
 
     def test_urm37_temperature_and_settings_api(self) -> None:
@@ -962,6 +997,8 @@ class ArduinoServiceTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             service.distance_sensor.get(5)
+        with self.assertRaises(ValueError):
+            service.line_sensor.get(2)
 
         summary = service.stop_activity_session()
         self.assertIsNone(summary["route_path"])
@@ -973,6 +1010,9 @@ class ArduinoServiceTests(unittest.TestCase):
         error_events = [event for event in events if event["action"] == "distance_sensor.get" and not event["success"]]
         self.assertEqual(len(error_events), 1)
         self.assertEqual(error_events[0]["error_type"], "ValueError")
+        line_error_events = [event for event in events if event["action"] == "line_sensor.get" and not event["success"]]
+        self.assertEqual(len(line_error_events), 1)
+        self.assertEqual(line_error_events[0]["error_type"], "ValueError")
 
         service.close()
 

@@ -38,12 +38,15 @@ MotorTarget = Literal["all", "left", "right"]
 WallSide = Literal["left", "right"]
 RotationDirection = Literal["left", "right"]
 DistanceSensorKind = Literal["disabled", "hc_sr04", "urm37"]
+LineSensorKind = Literal["disabled", "amp_b018"]
 Urm37MeasureMode = Literal["pwm_passive", "auto"]
 
 MIN_SERVO_ID = 1
 MAX_SERVO_ID = 2
 MIN_DISTANCE_SENSOR_ID = 1
 MAX_DISTANCE_SENSOR_ID = 4
+MIN_LINE_SENSOR_ID = 1
+MAX_LINE_SENSOR_ID = 1
 URM37_AUTO_INTERVAL_MIN_MS = 25
 URM37_AUTO_INTERVAL_MAX_MS = 255
 URM37_COMPARE_DISTANCE_MIN_CM = 0
@@ -89,6 +92,13 @@ def _validate_sensor_id(sensor_id: int, *, field_name: str = "sensor_id") -> int
     normalized_sensor_id = int(sensor_id)
     if not MIN_DISTANCE_SENSOR_ID <= normalized_sensor_id <= MAX_DISTANCE_SENSOR_ID:
         raise ValueError(f"{field_name} должен быть в диапазоне от 1 до 4")
+    return normalized_sensor_id
+
+
+def _validate_line_sensor_id(sensor_id: int, *, field_name: str = "sensor_id") -> int:
+    normalized_sensor_id = int(sensor_id)
+    if not MIN_LINE_SENSOR_ID <= normalized_sensor_id <= MAX_LINE_SENSOR_ID:
+        raise ValueError(f"{field_name} должен быть в диапазоне от {MIN_LINE_SENSOR_ID} до {MAX_LINE_SENSOR_ID}")
     return normalized_sensor_id
 
 
@@ -215,6 +225,18 @@ class DistanceSensorInfo:
 
 
 @dataclass(slots=True, frozen=True)
+class LineSensorInfo:
+    """Сводное описание цифрового датчика линии AMP-B018."""
+
+    sensor_id: int
+    enabled: bool
+    kind: LineSensorKind
+    pin: int | None
+    signal: int | None
+    detected: bool
+
+
+@dataclass(slots=True, frozen=True)
 class Urm37Settings:
     """Р‘РµР·РѕРїР°СЃРЅРѕРµ РїСЂРµРґСЃС‚Р°РІР»РµРЅРёРµ РЅР°СЃС‚СЂРѕРµРє URM37 РІ Python API."""
 
@@ -324,7 +346,7 @@ class ArduinoService:
     - управления моторами гусениц;
     - управления сервоприводами и реле.
 
-    Публичные атрибуты ``distance_sensor``, ``eng_all``, ``eng_l``, ``eng_r``,
+    Публичные атрибуты ``distance_sensor``, ``line_sensor``, ``eng_all``, ``eng_l``, ``eng_r``,
     ``servo``, ``servo2`` и ``relay`` являются частью рабочего API и
     используются как удобные фасады поверх базового serial-протокола.
     """
@@ -384,6 +406,7 @@ class ArduinoService:
         self.port = self._connect(port, baudrate)
 
         self.distance_sensor = DistanceSensorAccessor(self)
+        self.line_sensor = LineSensorAccessor(self)
         self.eng_all = MotorChannel(self, "all")
         self.eng_l = MotorChannel(self, "left")
         self.eng_r = MotorChannel(self, "right")
@@ -1022,6 +1045,100 @@ class ArduinoService:
             serial_tx_pin=None,
             serial_settings_available=False,
             distance_mm=None,
+        )
+
+    def _get_line_sensor_detected(self, sensor_id: int = 1) -> bool:
+        return self._run_logged_action(
+            category="sensor",
+            action="line_sensor.get",
+            params={"sensor_id": sensor_id},
+            protocol_op="get_line",
+            operation=lambda: self._read_line_sensor_detected(sensor_id),
+            success_text=lambda detected: (
+                f"Получено состояние датчика линии {sensor_id}: {'линия обнаружена' if detected else 'линия не обнаружена'} — Удачно"
+            ),
+            error_text=lambda exc: f"Не удалось получить состояние датчика линии {sensor_id}: {exc}",
+            result_transform=lambda detected: {"sensor_id": sensor_id, "detected": bool(detected)},
+            route_label=lambda detected: f"Л{sensor_id}: {'ON' if detected else 'OFF'}",
+        )
+
+    def _read_line_sensor_detected(self, sensor_id: int) -> bool:
+        response = self._send_request(
+            "get_line",
+            {"sensor": _validate_line_sensor_id(sensor_id)},
+            idempotent=True,
+            retries=self._retry_count,
+        )
+        return bool(response["detected"])
+
+    def _get_line_sensor_signal(self, sensor_id: int = 1) -> int:
+        return self._run_logged_action(
+            category="sensor",
+            action="line_sensor.signal",
+            params={"sensor_id": sensor_id},
+            protocol_op="get_line",
+            operation=lambda: self._read_line_sensor_signal(sensor_id),
+            success_text=lambda signal: (
+                f"Получен цифровой сигнал датчика линии {sensor_id}: {signal} — Удачно"
+            ),
+            error_text=lambda exc: f"Не удалось получить цифровой сигнал датчика линии {sensor_id}: {exc}",
+            result_transform=lambda signal: {"sensor_id": sensor_id, "signal": int(signal)},
+            route_label=lambda signal: f"Л{sensor_id}: {signal}",
+        )
+
+    def _read_line_sensor_signal(self, sensor_id: int) -> int:
+        response = self._send_request(
+            "get_line",
+            {"sensor": _validate_line_sensor_id(sensor_id)},
+            idempotent=True,
+            retries=self._retry_count,
+        )
+        return int(response["signal"])
+
+    def _get_line_sensor_info(self, sensor_id: int = 1) -> LineSensorInfo:
+        return self._run_logged_action(
+            category="sensor",
+            action="line_sensor.info",
+            params={"sensor_id": sensor_id},
+            protocol_op="get_status",
+            operation=lambda: self._read_line_sensor_info(sensor_id),
+            success_text=lambda info: (
+                f"Получена конфигурация датчика линии {info.sensor_id}: kind={info.kind}, enabled={info.enabled} — Удачно"
+            ),
+            error_text=lambda exc: f"Не удалось получить конфигурацию датчика линии {sensor_id}: {exc}",
+            result_transform=lambda info: asdict(info),
+        )
+
+    def _read_line_sensor_info(self, sensor_id: int) -> LineSensorInfo:
+        status_payload = self._send_request("get_status", idempotent=True, retries=self._retry_count)
+        return self._parse_line_sensor_info(status_payload, sensor_id)
+
+    def _parse_line_sensor_info(self, status_payload: dict[str, Any], sensor_id: int) -> LineSensorInfo:
+        normalized_sensor_id = _validate_line_sensor_id(sensor_id)
+        sensors = status_payload.get("line_sensors")
+        if isinstance(sensors, dict):
+            raw_sensor = sensors.get(str(normalized_sensor_id), sensors.get(normalized_sensor_id))
+            if isinstance(raw_sensor, dict):
+                enabled = bool(raw_sensor.get("enabled"))
+                raw_kind = str(raw_sensor.get("kind") or ("disabled" if not enabled else "amp_b018"))
+                kind: LineSensorKind = raw_kind if raw_kind in ("disabled", "amp_b018") else "disabled"
+                raw_signal = raw_sensor.get("signal")
+                return LineSensorInfo(
+                    sensor_id=normalized_sensor_id,
+                    enabled=enabled,
+                    kind=kind,
+                    pin=self._coerce_optional_int(raw_sensor.get("pin")),
+                    signal=None if raw_signal is None else int(raw_signal),
+                    detected=bool(raw_sensor.get("detected")),
+                )
+
+        return LineSensorInfo(
+            sensor_id=normalized_sensor_id,
+            enabled=False,
+            kind="disabled",
+            pin=None,
+            signal=None,
+            detected=False,
         )
 
     def _get_urm37_temperature(self, sensor_id: int) -> float:
@@ -2239,6 +2356,28 @@ class DistanceSensorAccessor:
             compare_distance_cm=compare_distance_cm,
             sensitivity=sensitivity,
         )
+
+
+class LineSensorAccessor:
+    """Фасад для чтения данных с цифрового датчика линии AMP-B018."""
+
+    def __init__(self, service: ArduinoService) -> None:
+        self._service = service
+
+    def get(self, sensor_id: int = 1) -> bool:
+        """Возвращает ``True``, если датчик видит черную линию или пустоту."""
+
+        return self._service._get_line_sensor_detected(sensor_id)
+
+    def signal(self, sensor_id: int = 1) -> int:
+        """Возвращает сырой цифровой сигнал датчика: ``0`` или ``1``."""
+
+        return self._service._get_line_sensor_signal(sensor_id)
+
+    def info(self, sensor_id: int = 1) -> LineSensorInfo:
+        """Возвращает сводную конфигурацию цифрового датчика линии."""
+
+        return self._service._get_line_sensor_info(sensor_id)
 
 
 class MotorChannel:

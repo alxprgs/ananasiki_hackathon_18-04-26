@@ -82,6 +82,7 @@ constexpr bool BUZZER_ENABLED = false;
 constexpr uint8_t SERVO_COUNT = 2;
 constexpr uint8_t PIN_NOT_ASSIGNED = 0xFF;
 constexpr uint8_t DISTANCE_SENSOR_COUNT = 4;
+constexpr uint8_t LINE_SENSOR_COUNT = 1;
 constexpr uint8_t URM37_DEFAULT_AUTO_INTERVAL_MS = 25;
 constexpr uint8_t URM37_DEFAULT_SENSITIVITY = 120;
 constexpr uint8_t SENSOR1_TRIG_PIN = 2;
@@ -111,6 +112,8 @@ constexpr uint8_t SENSOR4_SERIAL_TX_PIN = PIN_NOT_ASSIGNED;
 constexpr uint8_t BUTTON_PIN = A1;
 constexpr uint8_t LED_PIN = A4;
 constexpr uint8_t BUZZER_PIN = A5;
+constexpr bool LINE_SENSOR_ENABLED = true;
+constexpr uint8_t LINE_SENSOR1_PIN = AUX_PIN;
 }  // namespace Config
 
 /*
@@ -180,6 +183,11 @@ struct DistanceSensorState {
   unsigned long echoStartedUs;
   unsigned long nextTriggerAtMs;
   unsigned long lastSuccessAtMs;
+};
+
+struct LineSensorState {
+  bool enabled;
+  uint8_t pin;
 };
 
 // Текущее состояние одного DC-мотора и опциональный дедлайн timed-команды.
@@ -287,6 +295,12 @@ DistanceSensorState gSensors[Config::DISTANCE_SENSOR_COUNT] = {
 };
 int gActiveSensorIndex = -1;
 int gNextSensorIndex = 0;
+LineSensorState gLineSensors[Config::LINE_SENSOR_COUNT] = {
+    {
+        Config::LINE_SENSOR_ENABLED,
+        Config::LINE_SENSOR1_PIN,
+    },
+};
 
 MotorRuntimeState gLeftMotor = {0, false, 0, false, 0, 0, 0, 0};
 MotorRuntimeState gRightMotor = {0, false, 0, false, 0, 0, 0, 0};
@@ -861,6 +875,18 @@ bool isButtonPressed() {
   return digitalRead(Config::BUTTON_PIN) == LOW;
 }
 
+bool isLineSensorConfigured(const LineSensorState& sensor) {
+  return sensor.enabled && sensor.pin != Config::PIN_NOT_ASSIGNED;
+}
+
+uint8_t readLineSensorSignal(const LineSensorState& sensor) {
+  return digitalRead(sensor.pin) == HIGH ? 1 : 0;
+}
+
+bool isLineDetected(const LineSensorState& sensor) {
+  return readLineSensorSignal(sensor) != 0;
+}
+
 /*
  * Непосредственное применение команды к мотору.
  *
@@ -1193,6 +1219,17 @@ bool extractSensorIndex(long requestId, const char* payload, int& sensorIndex) {
   return true;
 }
 
+bool extractLineSensorIndex(long requestId, const char* payload, int& sensorIndex) {
+  long sensorId = 0;
+  if (!extractLongField(payload, PSTR("sensor"), sensorId) || sensorId < 1 ||
+      sensorId > static_cast<long>(Config::LINE_SENSOR_COUNT)) {
+    sendErrorResponse(requestId, F("bad_request"), F("sensor must be in range 1..1"));
+    return false;
+  }
+  sensorIndex = static_cast<int>(sensorId) - 1;
+  return true;
+}
+
 bool extractServoIndex(long requestId, const char* payload, int& servoIndex) {
   long servoId = 1;
   if (!extractLongField(payload, PSTR("servo_id"), servoId)) {
@@ -1248,6 +1285,30 @@ void printDistanceSensorStatusEntry(uint8_t sensorIndex) {
   Serial.print(F("}"));
 }
 
+void printLineSensorStatusEntry(uint8_t sensorIndex) {
+  const LineSensorState& sensor = gLineSensors[sensorIndex];
+  bool enabled = isLineSensorConfigured(sensor);
+  uint8_t signal = enabled ? readLineSensorSignal(sensor) : 0;
+
+  Serial.print(F("\""));
+  Serial.print(sensorIndex + 1);
+  Serial.print(F("\":{\"enabled\":"));
+  printBool(enabled);
+  Serial.print(F(",\"kind\":\""));
+  Serial.print(enabled ? F("amp_b018") : F("disabled"));
+  Serial.print(F("\",\"pin\":"));
+  printNullablePin(enabled ? sensor.pin : Config::PIN_NOT_ASSIGNED);
+  Serial.print(F(",\"signal\":"));
+  if (enabled) {
+    Serial.print(signal);
+  } else {
+    Serial.print(F("null"));
+  }
+  Serial.print(F(",\"detected\":"));
+  printBool(enabled && signal != 0);
+  Serial.print(F("}"));
+}
+
 // Сводный статус нужен для быстрой диагностики без отдельного вызова каждого датчика.
 void sendStatusResponse(long requestId) {
   Serial.print(F("{\"id\":"));
@@ -1299,6 +1360,13 @@ void sendStatusResponse(long requestId) {
       Serial.print(F(","));
     }
     printDistanceSensorStatusEntry(sensorIndex);
+  }
+  Serial.print(F("},\"line_sensors\":{"));
+  for (uint8_t sensorIndex = 0; sensorIndex < Config::LINE_SENSOR_COUNT; ++sensorIndex) {
+    if (sensorIndex > 0) {
+      Serial.print(F(","));
+    }
+    printLineSensorStatusEntry(sensorIndex);
   }
   Serial.println(F("}}}"));
 }
@@ -1796,7 +1864,32 @@ void handleStepperMove(long requestId, const char* payload) {
   Serial.print(durationMs);
   Serial.println(F("}}"));
 }
+
 #endif
+
+void handleLineRequest(long requestId, const char* payload) {
+  int sensorIndex = 0;
+  if (!extractLineSensorIndex(requestId, payload, sensorIndex)) {
+    return;
+  }
+
+  const LineSensorState& sensor = gLineSensors[sensorIndex];
+  if (!isLineSensorConfigured(sensor)) {
+    sendErrorResponse(requestId, F("not_configured"), F("line sensor slot is disabled"));
+    return;
+  }
+
+  uint8_t signal = readLineSensorSignal(sensor);
+  Serial.print(F("{\"id\":"));
+  Serial.print(requestId);
+  Serial.print(F(",\"ok\":true,\"data\":{\"sensor\":"));
+  Serial.print(sensorIndex + 1);
+  Serial.print(F(",\"signal\":"));
+  Serial.print(signal);
+  Serial.print(F(",\"detected\":"));
+  printBool(signal != 0);
+  Serial.println(F("}}"));
+}
 
 /*
  * Центральный диспетчер протокола.
@@ -1849,6 +1942,11 @@ void handleRequest(const char* payload) {
 
   if (equalsFlash(operation, PSTR("get_button"))) {
     handleButtonRequest(requestId);
+    return;
+  }
+
+  if (equalsFlash(operation, PSTR("get_line"))) {
+    handleLineRequest(requestId, payload);
     return;
   }
 
@@ -1991,6 +2089,11 @@ void setupPins() {
   }
 
   pinMode(Config::BUTTON_PIN, INPUT_PULLUP);
+  for (uint8_t index = 0; index < Config::LINE_SENSOR_COUNT; ++index) {
+    if (isLineSensorConfigured(gLineSensors[index])) {
+      pinMode(gLineSensors[index].pin, INPUT);
+    }
+  }
 
   #if SERVO_FEATURE_ENABLED
   if (Config::SERVO_ENABLED) {
