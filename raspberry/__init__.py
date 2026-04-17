@@ -10,7 +10,13 @@ from .arduino_service import (
     SerialTimeoutError,
     UnsupportedHardwareError,
 )
-from .raspberry_service import RaspberryCommandError, RaspberryService, RaspberryServiceError
+from .raspberry_service import (
+    RaspberryCommandError,
+    RaspberryService,
+    RaspberryServiceError,
+    VictimCamera,
+    VictimDetectionResult,
+)
 
 __all__ = [
     "ArduinoProtocolError",
@@ -26,4 +32,6 @@ __all__ = [
     "Urm37MeasureMode",
     "Urm37Settings",
     "UnsupportedHardwareError",
+    "VictimCamera",
+    "VictimDetectionResult",
 ]

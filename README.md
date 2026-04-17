@@ -17,6 +17,7 @@
   - [Журнал действий и оценочная карта движения](#журнал-действий-и-оценочная-карта-движения)
   - [RaspberryService](#raspberryservice)
   - [Телеметрия Raspberry Pi](#телеметрия-raspberry-pi)
+  - [VictimCamera](#victimcamera)
 - [Распиновка по умолчанию](#распиновка-по-умолчанию)
 - [Прошивка и отладка Arduino](#прошивка-и-отладка-arduino)
   - [Как прошить плату](#как-прошить-плату)
@@ -43,10 +44,13 @@
 
 - [arduino/arduino.ino](arduino/arduino.ino) — прошивка Arduino.
 - [raspberry/arduino_service.py](raspberry/arduino_service.py) — Python API для работы с Arduino по serial.
-- [raspberry/raspberry_service.py](raspberry/raspberry_service.py) — системные команды Raspberry Pi для AP-режима и SSH.
+- [raspberry/raspberry_service.py](raspberry/raspberry_service.py) — системные команды Raspberry Pi для AP-режима, SSH, телеметрии и vision-API камеры.
 - [raspberry/main.py](raspberry/main.py) — демонстрационная точка входа.
+- [raspberry/vision_main.py](raspberry/vision_main.py) — CLI для распознавания жертв по USB-камере и изображениям.
 - [tests/test_arduino_service.py](tests/test_arduino_service.py) — unit-тесты serial API.
 - [tests/test_raspberry_service.py](tests/test_raspberry_service.py) — unit-тесты системного сервиса Raspberry Pi.
+- [tests/test_victim_camera.py](tests/test_victim_camera.py) — unit-тесты распознавания жертв.
+- [tests/test_vision_main.py](tests/test_vision_main.py) — тесты CLI режима для vision-анализа.
 
 ## Архитектура
 
@@ -175,6 +179,8 @@ Python-слой разделён на два сервиса:
   - включает и отключает AP-режим;
   - восстанавливает прошлый Wi‑Fi-клиент;
   - завершает все активные SSH-сессии без остановки master `sshd`.
+  - читает встроенную телеметрию температуры и питания платы.
+  - включает `VictimCamera` для распознавания буквенных и цветовых жертв по USB-камере.
 
 ## Serial-протокол
 
@@ -1353,6 +1359,63 @@ print(telemetry["power"]["power_good_now"])
 - старается выбрать наименее загруженный канал в диапазоне 2.4 ГГц;
 - приоритетно использует непересекающиеся каналы `1`, `6` и `11`.
 
+### VictimCamera
+
+Примеры:
+
+```python
+from raspberry import VictimCamera
+
+camera = VictimCamera(camera_index=0, min_confidence=0.74, stability_frames=3)
+
+result = camera.detect_victim()
+print(result)
+print(camera.has_letter("H"))
+print(camera.get_letter())
+print(camera.get_color())
+
+file_result = camera.analyze_file("samples/victim_u.png")
+print(file_result.victim_type, file_result.letter, file_result.color)
+```
+
+`VictimCamera` предназначен для распознавания жертв на стенах лабиринта по USB-камере Raspberry Pi.
+
+Что умеет:
+
+- искать буквенные жертвы `H`, `S`, `U`;
+- искать цветовые жертвы `red`, `yellow`, `green`;
+- работать как по живому кадру камеры, так и по заранее загруженным изображениям;
+- отдавать структурированный результат `VictimDetectionResult`;
+- сглаживать live-детекцию по нескольким кадрам, чтобы одиночный шум не считался жертвой.
+
+Публичный результат `VictimDetectionResult` содержит:
+
+- `found` — найден ли уверенный кандидат;
+- `victim_type` — `none`, `letter` или `color`;
+- `letter` — буква `H`, `S`, `U` или `None`;
+- `color` — `black`, `red`, `yellow`, `green` или `None`;
+- `confidence` — итоговая уверенность;
+- `bbox` — рамка `(x, y, w, h)` в пикселях или `None`;
+- `source` — источник кадра, например `camera:0` или путь к файлу.
+
+Основные методы:
+
+- `capture_frame()` — читает кадр с USB-камеры;
+- `analyze_frame(frame, source="frame")` — анализирует уже готовый кадр;
+- `analyze_file(path)` — анализирует изображение с диска;
+- `detect_victim()` — читает кадр и применяет live-стабилизацию по окну `stability_frames`;
+- `has_letter(letter=None)` и `get_letter()` — удобные фасады для букв;
+- `has_color(color=None)` и `get_color()` — удобные фасады для цветов;
+- `render_debug_frame(frame, result=None)` — рисует рамку и подпись для визуальной отладки.
+
+Что важно по поведению:
+
+- для буквенной жертвы `get_color()` возвращает `black`;
+- `has_color()` без аргумента отвечает только за цветовые жертвы `red/yellow/green`, а `has_color("black")` полезен для буквенной жертвы;
+- если уверенность низкая или объект похож на шум, сервис возвращает `victim_type="none"`, а не пытается угадать;
+- сервис специально жёстче настроен против ложных срабатываний, чем против пропуска сомнительного кадра;
+- для тестов и эмуляции можно передать `frame_provider=...` вместо реальной камеры.
+
 ## Распиновка по умолчанию
 
 В прошивке сейчас заложена следующая базовая схема:
@@ -1470,6 +1533,12 @@ print(telemetry["power"]["power_good_now"])
 pip install -r raspberry/requirements.txt
 ```
 
+`raspberry/requirements.txt` теперь включает:
+
+- `pyserial` для обмена с Arduino;
+- `numpy` для обработки кадров;
+- `opencv-python-headless` для USB-камеры, анализа изображений и debug-кадров без GUI.
+
 Для AP-режима нужен `NetworkManager` и утилита `nmcli`.
 
 ## Демонстрационный запуск
@@ -1496,6 +1565,24 @@ python -m raspberry.main --diagnose-sensors --sensors 1 --samples 10 --interval 
 python -m raspberry.main --diagnose-sensors --sensors 1 2 3 4 --samples 5 --interval 0.5
 ```
 
+Проверка изображения с буквенной или цветовой жертвой:
+
+```bash
+python -m raspberry.vision_main examples/victim_h.png
+```
+
+Проверка сразу нескольких изображений и сохранение debug-кадров:
+
+```bash
+python -m raspberry.vision_main examples/victim_h.png examples/victim_green.png --debug-dir vision_debug
+```
+
+Проверка одного кадра напрямую с USB-камеры Raspberry Pi:
+
+```bash
+python -m raspberry.vision_main --camera-index 0 --debug-dir vision_debug
+```
+
 ## Тесты
 
 Локальные тесты Python запускаются так:
@@ -1513,6 +1600,10 @@ python -m unittest discover -s tests -v
 - формирование команд для `nmcli`;
 - выбор процессов для завершения SSH-сессий;
 - разбор температурной и энергетической телеметрии Raspberry Pi.
+- распознавание букв `H`, `S`, `U` с поворотами `0/90/180/270`;
+- распознавание цветовых жертв `red`, `yellow`, `green`;
+- защиту от шума и нецелевых букв/цветов;
+- file-mode и сохранение debug-изображений в vision CLI.
 
 ## Важные замечания
 
@@ -1521,3 +1612,4 @@ python -m unittest discover -s tests -v
 - Некоторые команды Raspberry Pi требуют повышенных прав.
   Проверка этих прав встроена в `RaspberryService` и срабатывает только на реальной Raspberry Pi.
 - Опциональные модули `servo`, `relay`, `led`, `buzzer` можно отключать в конфигурации прошивки; в этом случае Arduino будет возвращать явную ошибку `unsupported`.
+- `VictimCamera` по умолчанию предпочитает вернуть `none`, если кадр сомнительный, вместо того чтобы делать ложное распознавание жертвы.
