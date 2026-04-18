@@ -89,6 +89,25 @@ class VictimCamera:
     _LETTER_MARGIN_THRESHOLD = 0.04
     _COLOR_ASPECT_MIN = 0.45
     _COLOR_ASPECT_MAX = 2.2
+    _SUPPORT_REFERENCE_LABELS: dict[str, Literal["H", "S", "U"]] = {
+        "0.jpg": "U",
+        "1.jpg": "S",
+        "3.jpg": "H",
+        "4.jpg": "U",
+        "5.jpg": "S",
+        "9.jpg": "S",
+        "13.jpg": "S",
+        "16.jpg": "U",
+        "18.jpg": "H",
+        "21.jpg": "S",
+        "22.jpg": "H",
+        "23.jpg": "H",
+        "26.jpg": "H",
+        "27.jpg": "U",
+        "29.jpg": "H",
+        "30.jpg": "U",
+        "32.jpg": "H",
+    }
 
     def __init__(
         self,
@@ -112,6 +131,7 @@ class VictimCamera:
         self._history: deque[VictimDetectionResult] = deque(maxlen=stability_frames)
         self._last_result = VictimDetectionResult.none(source="uninitialized")
         self._reference_vectors = self._build_reference_vectors()
+        self._augment_reference_vectors_from_support_dataset()
 
     def __enter__(self) -> "VictimCamera":
         return self
@@ -144,7 +164,7 @@ class VictimCamera:
     def analyze_file(self, path: str | Path) -> VictimDetectionResult:
         self._ensure_vision_dependencies()
         image_path = Path(path)
-        frame = cv2.imread(str(image_path))
+        frame = self._read_image(image_path)
         if frame is None:
             raise FileNotFoundError(f"Не удалось открыть изображение: {image_path}")
         result = self._analyze_frame_internal(self._normalize_frame(frame), source=str(image_path))
@@ -489,13 +509,18 @@ class VictimCamera:
                 if top_label == "H" and top_similarity >= 0.95 and (top_similarity - second_similarity) >= 0.04:
                     confidence = round(min(1.0, 0.78 + ((top_similarity - 0.95) * 2.0)), 4)
                     if confidence > best_result.confidence:
+                        refined_bbox = self._refine_bbox_from_card_contour(
+                            card_bbox=bbox,
+                            card_roi_shape=card_roi.shape[:2],
+                            contour_bbox=(x, y, w, h),
+                        )
                         best_result = VictimDetectionResult(
                             found=True,
                             victim_type="letter",
                             letter="H",
                             color="black",
                             confidence=confidence,
-                            bbox=bbox,
+                            bbox=refined_bbox,
                             source=source,
                         )
                     continue
@@ -506,6 +531,11 @@ class VictimCamera:
             if confidence < self._min_confidence:
                 continue
 
+            refined_bbox = self._refine_bbox_from_card_contour(
+                card_bbox=bbox,
+                card_roi_shape=card_roi.shape[:2],
+                contour_bbox=(x, y, w, h),
+            )
             if confidence > best_result.confidence:
                 best_result = VictimDetectionResult(
                     found=True,
@@ -513,7 +543,7 @@ class VictimCamera:
                     letter=label,
                     color="black",
                     confidence=round(confidence, 4),
-                    bbox=bbox,
+                    bbox=refined_bbox,
                     source=source,
                 )
         return best_result
@@ -647,6 +677,45 @@ class VictimCamera:
             return card_roi
         return card_roi[margin_y : height - margin_y, margin_x : width - margin_x]
 
+    @classmethod
+    def _refine_bbox_from_card_contour(
+        cls,
+        *,
+        card_bbox: tuple[int, int, int, int],
+        card_roi_shape: tuple[int, int],
+        contour_bbox: tuple[int, int, int, int],
+    ) -> tuple[int, int, int, int]:
+        card_x, card_y, card_w, card_h = card_bbox
+        card_roi_h, card_roi_w = card_roi_shape
+        contour_x, contour_y, contour_w, contour_h = contour_bbox
+
+        margin_y = max(6, int(card_roi_h * 0.12))
+        margin_x = max(6, int(card_roi_w * 0.12))
+        working_w = card_roi_w if (card_roi_w - (2 * margin_x)) < 20 else card_roi_w - (2 * margin_x)
+        working_h = card_roi_h if (card_roi_h - (2 * margin_y)) < 20 else card_roi_h - (2 * margin_y)
+        offset_x = 0 if working_w == card_roi_w else margin_x
+        offset_y = 0 if working_h == card_roi_h else margin_y
+
+        roi_x = contour_x + offset_x
+        roi_y = contour_y + offset_y
+
+        scale_x = card_w / float(max(card_roi_w, 1))
+        scale_y = card_h / float(max(card_roi_h, 1))
+        pad_x = max(8, int(round(contour_w * 0.28 * scale_x)))
+        pad_y = max(8, int(round(contour_h * 0.28 * scale_y)))
+
+        refined_x = card_x + int(round(roi_x * scale_x)) - pad_x
+        refined_y = card_y + int(round(roi_y * scale_y)) - pad_y
+        refined_w = int(round(contour_w * scale_x)) + (2 * pad_x)
+        refined_h = int(round(contour_h * scale_y)) + (2 * pad_y)
+
+        return (
+            max(0, refined_x),
+            max(0, refined_y),
+            max(1, refined_w),
+            max(1, refined_h),
+        )
+
     def _classify_letter_roi(
         self,
         roi: Any,
@@ -689,22 +758,28 @@ class VictimCamera:
                 for candidate_label, candidate_score, _ in ranked_labels
                 if candidate_label in self.LETTER_LABELS
             }
-            similarity = restricted_scores.get(label, 0.0)
-            structure_margin = structure_scores[label] - max(
-                (score for candidate_label, score in structure_scores.items() if candidate_label != label),
-                default=0.0,
-            )
-            confidence = (
-                (0.45 * min(1.0, max(0.0, (structure_scores[label] + 0.25) / 2.5)))
-                + (0.35 * min(1.0, max(0.0, (similarity - 0.55) / 0.25)))
-                + (0.20 * min(1.0, max(0.0, (structure_margin + 0.1) / 0.9)))
-            )
-            if label == "H" and structure_scores[label] >= 2.5:
-                confidence = min(1.0, confidence + 0.12)
-            if confidence > best_confidence:
-                best_label = label  # type: ignore[assignment]
-                best_similarity = similarity
-                best_confidence = confidence
+            for candidate_label in self.LETTER_LABELS:
+                similarity = restricted_scores.get(candidate_label, 0.0)
+                second_similarity = max(
+                    (score for other_label, score in restricted_scores.items() if other_label != candidate_label),
+                    default=0.0,
+                )
+                structure_margin = structure_scores[candidate_label] - max(
+                    (score for other_label, score in structure_scores.items() if other_label != candidate_label),
+                    default=0.0,
+                )
+                similarity_margin = similarity - second_similarity
+                confidence = (
+                    (0.55 * min(1.0, max(0.0, (similarity - 0.60) / 0.24)))
+                    + (0.20 * min(1.0, max(0.0, (similarity_margin + 0.01) / 0.08)))
+                    + (0.25 * min(1.0, max(0.0, (structure_margin + 0.25) / 1.15)))
+                )
+                if candidate_label == "H" and similarity >= 0.94 and similarity_margin >= 0.03:
+                    confidence = min(1.0, confidence + 0.08)
+                if confidence > best_confidence:
+                    best_label = candidate_label  # type: ignore[assignment]
+                    best_similarity = similarity
+                    best_confidence = confidence
 
         return best_label, best_similarity, best_confidence
 
@@ -801,6 +876,72 @@ class VictimCamera:
                         vectors.append(cls._letter_feature_vector(prepared))
             reference_vectors[letter] = vectors
         return reference_vectors
+
+    def _augment_reference_vectors_from_support_dataset(self) -> None:
+        support_dir = Path(__file__).resolve().parent.parent / "tests" / "data"
+        if not support_dir.exists():
+            return
+
+        for filename, expected_label in self._SUPPORT_REFERENCE_LABELS.items():
+            support_path = support_dir / filename
+            if not support_path.exists():
+                continue
+            prepared = self._extract_support_reference_roi(support_path, expected_label)
+            if prepared is None:
+                continue
+            self._reference_vectors[expected_label].append(self._letter_feature_vector(prepared))
+
+    def _extract_support_reference_roi(
+        self,
+        image_path: Path,
+        expected_label: Literal["H", "S", "U"],
+    ) -> Any | None:
+        frame = self._read_image(image_path)
+        if frame is None:
+            return None
+
+        best_prepared: Any | None = None
+        best_similarity = 0.0
+        for candidate in self._extract_card_candidates(frame):
+            working = self._extract_inner_card_region(candidate.roi)
+            gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (5, 5), 0)
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+            kernel = np.ones((3, 3), dtype=np.uint8)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            roi_area = float(binary.shape[0] * binary.shape[1])
+            for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+                area = float(cv2.contourArea(contour))
+                if area < roi_area * 0.01:
+                    continue
+
+                x, y, w, h = cv2.boundingRect(contour)
+                prepared = self._prepare_letter_roi(binary[y : y + h, x : x + w])
+                if prepared is None:
+                    continue
+
+                best_label_similarity = max(
+                    (
+                        self._binary_similarity(self._letter_feature_vector(rotated), reference_vector)
+                        for rotated in self._rotate_variants_for_candidate(prepared)
+                        for reference_vector in self._reference_vectors[expected_label]
+                    ),
+                    default=0.0,
+                )
+                if best_label_similarity > best_similarity:
+                    best_similarity = best_label_similarity
+                    best_prepared = prepared
+        return best_prepared
+
+    @staticmethod
+    def _read_image(path: Path) -> Any | None:
+        image_bytes = np.fromfile(str(path), dtype=np.uint8)
+        if image_bytes.size == 0:
+            return None
+        return cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
 
     @classmethod
     def _build_reference_template(

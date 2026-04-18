@@ -180,8 +180,18 @@ class VictimCameraTests(unittest.TestCase):
             "0.jpg": "U",
             "1.jpg": "S",
             "3.jpg": "H",
+            "4.jpg": "U",
+            "5.jpg": "S",
+            "9.jpg": "S",
+            "13.jpg": "S",
+            "16.jpg": "U",
+            "18.jpg": "H",
             "20.jpg": "U",
             "21.jpg": "S",
+            "22.jpg": "H",
+            "23.jpg": "H",
+            "26.jpg": "H",
+            "27.jpg": "U",
             "29.jpg": "H",
             "30.jpg": "U",
             "32.jpg": "H",
@@ -201,6 +211,18 @@ class VictimCameraTests(unittest.TestCase):
             with self.subTest(filename=filename):
                 result = camera.analyze_file(Path("tests") / "data" / filename)
                 self.assertNotEqual(result.victim_type, "color")
+
+    def test_real_dataset_distant_card_uses_local_bbox(self) -> None:
+        camera = VictimCamera()
+        result = camera.analyze_file(Path("tests") / "data" / "23.jpg")
+
+        self.assertTrue(result.found)
+        self.assertEqual(result.letter, "H")
+        self.assertIsNotNone(result.bbox)
+        assert result.bbox is not None
+        _, _, width, height = result.bbox
+        self.assertLess(width, 800)
+        self.assertLess(height, 500)
 
 
 if __name__ == "__main__":
